@@ -24,6 +24,10 @@ type Browser interface {
 	Open(ctx context.Context, url string) (surface string, err error)
 	Goto(ctx context.Context, surface, url string) error
 	Eval(ctx context.Context, surface, script string, out any) error
+	// AcceptDialog accepts a dialog the page is showing and reports
+	// whether there was one.
+	AcceptDialog(ctx context.Context, surface string) (bool, error)
+	Close(ctx context.Context, surface string) error
 }
 
 // Stream says what to play: a YouTube or YouTube Music URL, or, when URL is
@@ -115,6 +119,7 @@ type Status struct {
 	Stream        Stream    `json:"stream"`
 	Ad            bool      `json:"ad"`
 	SignedIn      bool      `json:"signed_in"`
+	Dialogs       int       `json:"dialogs_accepted"`
 	Surface       string    `json:"surface,omitempty"`
 	Page          string    `json:"page,omitempty"`
 	Title         string    `json:"title,omitempty"`
@@ -137,6 +142,7 @@ type Player struct {
 	metricAt     time.Time
 	paused       bool
 	next         bool
+	dialogs      int // page dialogs accepted
 	stream       Stream
 
 	status Status // published by the loop after every step
@@ -197,6 +203,15 @@ func (p *Player) Next() {
 	p.next = true
 }
 
+// NoteDialog records that a dialog shown by the page, such as "Leave
+// site?", was accepted.
+func (p *Player) NoteDialog(surface string) {
+	p.mu.Lock()
+	p.dialogs++
+	p.mu.Unlock()
+	p.log.Info("accepted a dialog the page was showing", "surface", surface)
+}
+
 // SetStream switches to another stream.
 func (p *Player) SetStream(s Stream) {
 	p.mu.Lock()
@@ -220,7 +235,7 @@ func (p *Player) Status() Status {
 	s := p.status
 	s.Metric, s.MetricSource, s.MetricUpdated = p.metric, p.metricSource, p.metricAt
 	s.TargetRate, s.MetricStale = p.target()
-	s.Paused, s.Stream = p.paused, p.stream
+	s.Paused, s.Stream, s.Dialogs = p.paused, p.stream, p.dialogs
 	return s
 }
 
@@ -333,8 +348,11 @@ func (p *Player) Step(ctx context.Context) {
 	case p.phase == phasePlaying:
 		err = p.play(ctx)
 	}
-	p.note(err)
+	p.note(ctx, err)
 }
+
+// errWaiting means the step did nothing but wait, so the last outcome stands.
+var errWaiting = errors.New("waiting")
 
 func (p *Player) open(ctx context.Context) error {
 	if !p.triedSaved {
@@ -344,7 +362,7 @@ func (p *Player) open(ctx context.Context) error {
 		}
 	}
 	if !p.lastOpen.IsZero() && p.now().Sub(p.lastOpen) < p.cfg.ReopenAfter {
-		return nil
+		return errWaiting
 	}
 	p.lastOpen = p.now()
 	surface, err := p.b.Open(ctx, p.startURL())
@@ -375,7 +393,14 @@ func (p *Player) adopt(ctx context.Context) bool {
 	}
 	var pg page
 	w := want{Rate: p.rate, KeepPitch: p.cfg.KeepPitch, Play: !p.pausedNow}
-	if p.b.Eval(ctx, surface, tickScript(w), &pg) != nil || !strings.HasSuffix(pg.Host, "youtube.com") {
+	err = p.b.Eval(ctx, surface, tickScript(w), &pg)
+	if err != nil {
+		// The tab may be waiting on a dialog left from the last run.
+		if ok, _ := p.b.AcceptDialog(ctx, surface); ok {
+			err = p.b.Eval(ctx, surface, tickScript(w), &pg)
+		}
+	}
+	if err != nil || !strings.HasSuffix(pg.Host, "youtube.com") {
 		return false
 	}
 	p.surface = surface
@@ -478,21 +503,35 @@ func (p *Player) restart(ctx context.Context) error {
 // note records the outcome of a step. Three failures in a row that are not
 // cmux being unreachable or a script error mean the surface is gone, so the
 // player opens a new one.
-func (p *Player) note(err error) {
+func (p *Player) note(ctx context.Context, err error) {
 	if err == nil {
 		p.fails, p.lastErr = 0, ""
+		return
+	}
+	if errors.Is(err, errWaiting) {
 		return
 	}
 	if err.Error() != p.lastErr {
 		p.log.Error("cmux", "error", err)
 	}
 	p.lastErr = err.Error()
-	if errors.Is(err, cmux.ErrUnavailable) || errors.Is(err, cmux.ErrScript) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, cmux.ErrUnavailable) || errors.Is(err, context.Canceled) || p.surface == "" {
+		return
+	}
+	// A page showing a dialog, such as "Leave site?", answers nothing else
+	// until the dialog is dealt with.
+	if ok, _ := p.b.AcceptDialog(ctx, p.surface); ok {
+		p.fails = 0
+		return
+	}
+	if errors.Is(err, cmux.ErrScript) {
 		return
 	}
 	p.fails++
 	if p.fails >= 3 && p.phase != phaseOpening {
 		p.log.Warn("browser surface lost; opening a new one", "surface", p.surface)
+		// Do not leave the old tab behind if it is still there.
+		_ = p.b.Close(ctx, p.surface)
 		p.fails, p.surface = 0, ""
 		p.setPhase(phaseOpening)
 	}

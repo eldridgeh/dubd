@@ -25,6 +25,8 @@ type fakeBrowser struct {
 	ids    []string // tracks the search page shows
 	stuck  bool     // playback does not advance
 	ad     bool     // an advert is showing
+	dialog bool     // the page shows a dialog and answers nothing else
+	closed []string // surfaces closed
 	gone   bool     // the surface no longer exists
 	err    error    // every call fails with this
 	pos    float64
@@ -42,9 +44,26 @@ func (f *fakeBrowser) Open(_ context.Context, url string) (string, error) {
 	return "surface:" + string(rune('0'+len(f.opened))), nil
 }
 
+func (f *fakeBrowser) AcceptDialog(context.Context, string) (bool, error) {
+	if f.err != nil || f.gone {
+		return false, errors.New("Command timed out")
+	}
+	was := f.dialog
+	f.dialog = false
+	return was, nil
+}
+
+func (f *fakeBrowser) Close(_ context.Context, surface string) error {
+	f.closed = append(f.closed, surface)
+	return nil
+}
+
 func (f *fakeBrowser) Goto(_ context.Context, _ string, url string) error {
 	if f.err != nil {
 		return f.err
+	}
+	if f.dialog {
+		return errors.New("Command timed out")
 	}
 	if f.gone {
 		return errors.New("not_found: surface")
@@ -60,6 +79,9 @@ func (f *fakeBrowser) Eval(_ context.Context, _ string, script string, out any) 
 	}
 	if f.gone {
 		return errors.New("not_found: surface")
+	}
+	if f.dialog {
+		return errors.New("Command timed out")
 	}
 	var res any
 	if m := wantRE.FindStringSubmatch(script); m != nil {
@@ -249,6 +271,9 @@ func TestLostSurfaceIsReopened(t *testing.T) {
 	if len(f.opened) != 2 || p.Status().Phase != phasePlaying || p.Status().Error != "" {
 		t.Fatalf("opened = %d status = %+v", len(f.opened), p.Status())
 	}
+	if len(f.closed) != 1 || f.closed[0] != "surface:1" {
+		t.Fatalf("closed = %q, want the abandoned surface", f.closed)
+	}
 }
 
 func TestUnreachableCmuxOpensNothingExtra(t *testing.T) {
@@ -415,5 +440,39 @@ func TestStreamSwitchIsRetriedAfterAFailure(t *testing.T) {
 	}
 	if saved, _ := os.ReadFile(file); !strings.Contains(string(saved), link) {
 		t.Fatalf("the new stream was not recorded: %q", saved)
+	}
+}
+
+func TestDialogIsAcceptedNotTreatedAsALostTab(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}}, f, 5)
+	steps(p, c, 4)
+	f.dialog = true
+	steps(p, c, 6)
+	if f.dialog || len(f.opened) != 1 || len(f.closed) != 0 || p.Status().Error != "" || p.Status().Phase != phasePlaying {
+		t.Fatalf("dialog %v opened %d closed %q status %+v", f.dialog, len(f.opened), f.closed, p.Status())
+	}
+}
+
+func TestReusedTabWithADialogIsKept(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "surface")
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
+	steps(p, c, 4)
+
+	f.dialog = true
+	p2, c2 := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
+	steps(p2, c2, 3)
+	if len(f.opened) != 1 || p2.Status().Surface != "surface:1" || p2.Status().Error != "" {
+		t.Fatalf("opened %d status %+v", len(f.opened), p2.Status())
+	}
+}
+
+func TestOpenFailureStaysReported(t *testing.T) {
+	f := &fakeBrowser{err: errors.New("browser is disabled")}
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, ReopenAfter: 10 * time.Second}, f, 5)
+	steps(p, c, 5)
+	if got := p.Status().Error; got != "browser is disabled" {
+		t.Fatalf("error while waiting to retry = %q", got)
 	}
 }

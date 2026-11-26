@@ -160,6 +160,7 @@ func run(args []string) error {
 		StaleAfter: *staleAfter, SurfaceFile: surfaceFile(),
 	}
 	p := player.New(cfg, browser, log, *start)
+	browser.OnDialog = p.NoteDialog
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {

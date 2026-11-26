@@ -31,7 +31,12 @@ type Runner func(ctx context.Context, bin string, args ...string) (stdout, stder
 type Client struct {
 	Bin     string
 	Timeout time.Duration
-	Run     Runner
+	// DialogDelay is how long Goto waits before it looks for a dialog
+	// that is holding the navigation up.
+	DialogDelay time.Duration
+	// OnDialog, when set, is called after a dialog was accepted.
+	OnDialog func(surface string)
+	Run      Runner
 }
 
 // Find locates the cmux CLI: the explicit path if given, then $PATH, then
@@ -54,7 +59,7 @@ func Find(explicit string) (string, error) {
 
 // New returns a client for the CLI at bin.
 func New(bin string) *Client {
-	return &Client{Bin: bin, Timeout: 25 * time.Second, Run: execRunner}
+	return &Client{Bin: bin, Timeout: 25 * time.Second, DialogDelay: time.Second, Run: execRunner}
 }
 
 func execRunner(ctx context.Context, bin string, args ...string) ([]byte, []byte, error) {
@@ -131,9 +136,43 @@ func (c *Client) Open(ctx context.Context, url string) (string, error) {
 	return "", errors.New("cmux opened a browser but did not report its surface")
 }
 
-// Goto navigates the surface to url.
+// Goto navigates the surface to url. A page that is playing music asks
+// "Leave site?" before it lets go, and cmux holds the navigation until that
+// is answered, so Goto answers it while the navigation is under way.
 func (c *Client) Goto(ctx context.Context, surface, url string) error {
-	_, err := c.call(ctx, "browser", "--surface", surface, "goto", url)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.call(ctx, "browser", "--surface", surface, "goto", url)
+		done <- err
+	}()
+	wait := c.DialogDelay
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(wait):
+			_, _ = c.AcceptDialog(ctx, surface)
+			wait = 2 * c.DialogDelay
+		}
+	}
+}
+
+// AcceptDialog accepts the dialog the surface's page is showing, such as
+// "Leave site?", and reports whether there was one.
+func (c *Client) AcceptDialog(ctx context.Context, surface string) (bool, error) {
+	_, err := c.call(ctx, "browser", "--surface", surface, "dialog", "accept")
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no pending dialog") {
+		return false, nil
+	}
+	if err == nil && c.OnDialog != nil {
+		c.OnDialog(surface)
+	}
+	return err == nil, err
+}
+
+// Close closes the surface.
+func (c *Client) Close(ctx context.Context, surface string) error {
+	_, err := c.call(ctx, "close-surface", "--surface", surface)
 	return err
 }
 
