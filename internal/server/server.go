@@ -16,6 +16,7 @@ type Player interface {
 	SetMetric(v int, source string)
 	SetPaused(paused bool)
 	Next()
+	SetStream(s player.Stream)
 	Status() player.Status
 }
 
@@ -32,6 +33,7 @@ type Info struct {
 //	PUT  /metric          set the metric; the body is an integer (POST also works)
 //	POST /pause, /play    pause or resume the stream
 //	POST /next            move to another stream
+//	PUT  /stream          play something else; the body is a link or search words (POST also works)
 func New(p Player, version string) http.Handler {
 	mux := http.NewServeMux()
 	status := func(w http.ResponseWriter) {
@@ -63,6 +65,22 @@ func New(p Player, version string) http.Handler {
 	mux.HandleFunc("POST /metric", setMetric)
 	mux.HandleFunc("POST /pause", func(w http.ResponseWriter, _ *http.Request) { p.SetPaused(true); status(w) })
 	mux.HandleFunc("POST /play", func(w http.ResponseWriter, _ *http.Request) { p.SetPaused(false); status(w) })
+	setStream := func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 2048))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s, err := player.ParseStream(string(body))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		p.SetStream(s)
+		status(w)
+	}
+	mux.HandleFunc("PUT /stream", setStream)
+	mux.HandleFunc("POST /stream", setStream)
 	mux.HandleFunc("POST /next", func(w http.ResponseWriter, _ *http.Request) { p.Next(); status(w) })
 	return localOnly(mux)
 }

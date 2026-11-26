@@ -50,6 +50,8 @@ Usage:
   dubd status          print the running daemon's state
   dubd pause | play    pause or resume the stream
   dubd next            move to another stream
+  dubd stream <link | search words>
+                       play something else: a YouTube Music link, or a search
   dubd version
 
 Run "dubd run -h" for the daemon's flags.
@@ -74,6 +76,8 @@ func main() {
 		err = client(args, "play")
 	case "next":
 		err = client(args, "next")
+	case "stream":
+		err = client(args, "stream")
 	case "version", "--version":
 		fmt.Println("dubd", buildVersion())
 	case "help", "-h", "--help":
@@ -96,7 +100,7 @@ func run(args []string) error {
 	var (
 		addr       = fs.String("addr", defaultAddr, "address the local HTTP API listens on")
 		query      = fs.String("query", "ai dub reggae", "YouTube Music search; the stream is the radio of a top result")
-		streamURL  = fs.String("url", "", "play this YouTube Music URL instead of searching")
+		streamURL  = fs.String("url", "", "play this YouTube Music link (a playlist, album or track) instead of searching")
 		start      = fs.Int("metric", 0, "metric value to start with")
 		metricMin  = fs.Int("metric-min", 0, "metric value that plays at rate-min")
 		metricMax  = fs.Int("metric-max", 12, "metric value that plays at rate-max")
@@ -124,7 +128,17 @@ func run(args []string) error {
 		return errors.New("use -metric-cmd or -metric-file, not both")
 	case *interval < time.Second:
 		return errors.New("-interval must be at least 1s")
-	case *streamURL == "" && strings.TrimSpace(*query) == "":
+	}
+	stream := player.Stream{Query: strings.TrimSpace(*query)}
+	if *streamURL != "" {
+		var err error
+		if stream, err = player.ParseStream(*streamURL); err != nil {
+			return fmt.Errorf("-url: %w", err)
+		}
+		if stream.URL == "" {
+			return errors.New("-url must be a link; use -query for search words")
+		}
+	} else if stream.Query == "" {
 		return errors.New("-query must not be empty")
 	}
 
@@ -142,10 +156,11 @@ func run(args []string) error {
 	}
 
 	cfg := player.Config{
-		URL: *streamURL, Query: *query, Curve: curve, KeepPitch: !*tape,
+		Stream: stream, Curve: curve, KeepPitch: !*tape,
 		StaleAfter: *staleAfter, SurfaceFile: surfaceFile(),
 	}
 	p := player.New(cfg, browser, log, *start)
+	browser.OnDialog = p.NoteDialog
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -210,8 +225,14 @@ func client(args []string, cmd string) error {
 			return err
 		}
 		method, path, body = http.MethodPut, "/metric", fs.Arg(0)
+	case "stream":
+		body = strings.Join(fs.Args(), " ")
+		if _, err := player.ParseStream(body); err != nil {
+			return fmt.Errorf("usage: dubd stream [-addr host:port] <link | search words>: %w", err)
+		}
+		method = http.MethodPut
 	}
-	if cmd != "set" && fs.NArg() > 0 {
+	if cmd != "set" && cmd != "stream" && fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
 	req, err := http.NewRequest(method, "http://"+*addr+path, strings.NewReader(body))

@@ -5,6 +5,7 @@ package player
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/url"
@@ -23,14 +24,48 @@ type Browser interface {
 	Open(ctx context.Context, url string) (surface string, err error)
 	Goto(ctx context.Context, surface, url string) error
 	Eval(ctx context.Context, surface, script string, out any) error
+	// AcceptDialog accepts a dialog the page is showing and reports
+	// whether there was one.
+	AcceptDialog(ctx context.Context, surface string) (bool, error)
+	Close(ctx context.Context, surface string) error
+}
+
+// Stream says what to play: a YouTube or YouTube Music URL, or, when URL is
+// empty, a YouTube Music search whose top results' radios are played.
+type Stream struct {
+	URL   string `json:"url,omitempty"`
+	Query string `json:"query,omitempty"`
+}
+
+// ParseStream reads a stream from text: a link, or search words. A link to
+// a playlist page, which does not play by itself, becomes the link that
+// plays that playlist.
+func ParseStream(text string) (Stream, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return Stream{}, errors.New("no link or search words given")
+	}
+	if !strings.HasPrefix(text, "http://") && !strings.HasPrefix(text, "https://") {
+		return Stream{Query: text}, nil
+	}
+	u, err := url.Parse(text)
+	if err != nil {
+		return Stream{}, fmt.Errorf("not a usable link: %w", err)
+	}
+	host := strings.ToLower(u.Hostname())
+	if u.Scheme != "https" || (host != "youtube.com" && !strings.HasSuffix(host, ".youtube.com")) {
+		return Stream{}, errors.New("the link must be an https youtube.com or music.youtube.com link")
+	}
+	if list := u.Query().Get("list"); u.Path == "/playlist" && list != "" {
+		u.Path, u.RawQuery = "/watch", url.Values{"list": {list}}.Encode()
+	}
+	return Stream{URL: u.String()}, nil
 }
 
 // Config is the player's settings.
 type Config struct {
-	// URL plays a specific YouTube Music page. When empty, the player
-	// searches YouTube Music for Query and plays the radio of a result.
-	URL   string
-	Query string
+	// Stream is what to play at the start.
+	Stream Stream
 
 	Curve     tempo.Curve
 	KeepPitch bool
@@ -81,8 +116,10 @@ type Status struct {
 	Rate          float64   `json:"rate"`
 	Phase         string    `json:"phase"`
 	Paused        bool      `json:"paused"`
+	Stream        Stream    `json:"stream"`
 	Ad            bool      `json:"ad"`
 	SignedIn      bool      `json:"signed_in"`
+	Dialogs       int       `json:"dialogs_accepted"`
 	Surface       string    `json:"surface,omitempty"`
 	Page          string    `json:"page,omitempty"`
 	Title         string    `json:"title,omitempty"`
@@ -105,11 +142,15 @@ type Player struct {
 	metricAt     time.Time
 	paused       bool
 	next         bool
+	dialogs      int // page dialogs accepted
+	stream       Stream
 
 	status Status // published by the loop after every step
 
 	// The fields below belong to the loop goroutine alone.
 	pausedNow    bool
+	pending      bool   // a new stream is still to be loaded
+	src          Stream // the stream the loop is working on
 	phase        string
 	phaseSince   time.Time
 	surface      string
@@ -132,6 +173,7 @@ func New(cfg Config, b Browser, log *slog.Logger, metric int) *Player {
 	p := &Player{cfg: cfg, b: b, log: log, now: time.Now, phase: phaseOpening}
 	p.metric, p.metricSource, p.metricAt = metric, "start", p.now()
 	p.status = Status{Phase: phaseOpening}
+	p.stream, p.src = cfg.Stream, cfg.Stream
 	return p
 }
 
@@ -161,6 +203,22 @@ func (p *Player) Next() {
 	p.next = true
 }
 
+// NoteDialog records that a dialog shown by the page, such as "Leave
+// site?", was accepted.
+func (p *Player) NoteDialog(surface string) {
+	p.mu.Lock()
+	p.dialogs++
+	p.mu.Unlock()
+	p.log.Info("accepted a dialog the page was showing", "surface", surface)
+}
+
+// SetStream switches to another stream.
+func (p *Player) SetStream(s Stream) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stream, p.next = s, true
+}
+
 // target is the rate the current metric calls for. Caller holds mu.
 func (p *Player) target() (rate float64, stale bool) {
 	stale = p.cfg.StaleAfter > 0 && p.now().Sub(p.metricAt) > p.cfg.StaleAfter
@@ -177,7 +235,7 @@ func (p *Player) Status() Status {
 	s := p.status
 	s.Metric, s.MetricSource, s.MetricUpdated = p.metric, p.metricSource, p.metricAt
 	s.TargetRate, s.MetricStale = p.target()
-	s.Paused = p.paused
+	s.Paused, s.Stream, s.Dialogs = p.paused, p.stream, p.dialogs
 	return s
 }
 
@@ -223,12 +281,12 @@ func (p *Player) stop() {
 }
 
 func (p *Player) searchURL() string {
-	return "https://music.youtube.com/search?q=" + url.QueryEscape(p.cfg.Query)
+	return "https://music.youtube.com/search?q=" + url.QueryEscape(p.src.Query)
 }
 
 func (p *Player) startURL() string {
-	if p.cfg.URL != "" {
-		return p.cfg.URL
+	if p.src.URL != "" {
+		return p.src.URL
 	}
 	return p.searchURL()
 }
@@ -256,7 +314,13 @@ func (p *Player) Step(ctx context.Context) {
 	paused := p.paused
 	next := p.next
 	p.next = false
+	if p.src != p.stream {
+		p.src, p.pick, p.seed = p.stream, 0, ""
+	}
 	p.mu.Unlock()
+	if next {
+		p.pending = true
+	}
 	if p.pausedNow && !paused {
 		p.lastProgress = p.now() // resuming is not a stall
 	}
@@ -268,21 +332,27 @@ func (p *Player) Step(ctx context.Context) {
 	p.rate = target
 
 	var err error
-	switch p.phase {
-	case phaseOpening:
+	switch {
+	case p.phase == phaseOpening:
 		err = p.open(ctx)
-	case phaseSearching:
-		err = p.search(ctx)
-	case phasePlaying:
-		if next {
-			p.log.Info("moving to the next stream")
-			err = p.restart(ctx)
-		} else {
-			err = p.play(ctx)
+	case p.pending:
+		// Stays pending until the navigation succeeds, so a failure is
+		// retried on the next step, and only then is the stream recorded.
+		if err = p.restart(ctx); err == nil {
+			p.pending = false
+			p.saveSurface()
+			p.log.Info("started another stream", "url", p.src.URL, "query", p.src.Query)
 		}
+	case p.phase == phaseSearching:
+		err = p.search(ctx)
+	case p.phase == phasePlaying:
+		err = p.play(ctx)
 	}
-	p.note(err)
+	p.note(ctx, err)
 }
+
+// errWaiting means the step did nothing but wait, so the last outcome stands.
+var errWaiting = errors.New("waiting")
 
 func (p *Player) open(ctx context.Context) error {
 	if !p.triedSaved {
@@ -292,17 +362,17 @@ func (p *Player) open(ctx context.Context) error {
 		}
 	}
 	if !p.lastOpen.IsZero() && p.now().Sub(p.lastOpen) < p.cfg.ReopenAfter {
-		return nil
+		return errWaiting
 	}
 	p.lastOpen = p.now()
 	surface, err := p.b.Open(ctx, p.startURL())
 	if err != nil {
 		return err
 	}
-	p.surface = surface
+	p.surface, p.pending = surface, false
 	p.saveSurface()
 	p.log.Info("opened browser surface", "surface", surface, "url", p.startURL())
-	if p.cfg.URL != "" {
+	if p.src.URL != "" {
 		p.setPhase(phasePlaying)
 	} else {
 		p.setPhase(phaseSearching)
@@ -317,13 +387,20 @@ func (p *Player) adopt(ctx context.Context) bool {
 		return false
 	}
 	raw, err := os.ReadFile(p.cfg.SurfaceFile)
-	surface := strings.TrimSpace(string(raw))
+	surface, was, _ := strings.Cut(strings.TrimSpace(string(raw)), "\n")
 	if err != nil || surface == "" {
 		return false
 	}
 	var pg page
 	w := want{Rate: p.rate, KeepPitch: p.cfg.KeepPitch, Play: !p.pausedNow}
-	if p.b.Eval(ctx, surface, tickScript(w), &pg) != nil || !strings.HasSuffix(pg.Host, "youtube.com") {
+	err = p.b.Eval(ctx, surface, tickScript(w), &pg)
+	if err != nil {
+		// The tab may be waiting on a dialog left from the last run.
+		if ok, _ := p.b.AcceptDialog(ctx, surface); ok {
+			err = p.b.Eval(ctx, surface, tickScript(w), &pg)
+		}
+	}
+	if err != nil || !strings.HasSuffix(pg.Host, "youtube.com") {
 		return false
 	}
 	p.surface = surface
@@ -332,15 +409,26 @@ func (p *Player) adopt(ctx context.Context) bool {
 	// Give it a few seconds to show it is playing before starting over.
 	p.lastProgress = p.now().Add(5*time.Second - p.cfg.StallAfter)
 	p.log.Info("reusing browser surface", "surface", surface)
+	// The tab may be playing what an earlier run was asked for.
+	p.pending = was != p.streamKey()
 	return true
 }
 
+// streamKey identifies the stream in the surface file.
+func (p *Player) streamKey() string {
+	if p.src.URL != "" {
+		return p.src.URL
+	}
+	return "search: " + p.src.Query
+}
+
+// saveSurface records the surface and the stream it was given.
 func (p *Player) saveSurface() {
-	if p.cfg.SurfaceFile == "" {
+	if p.cfg.SurfaceFile == "" || p.surface == "" {
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(p.cfg.SurfaceFile), 0o755); err == nil {
-		err = os.WriteFile(p.cfg.SurfaceFile, []byte(p.surface+"\n"), 0o644)
+		err = os.WriteFile(p.cfg.SurfaceFile, []byte(p.surface+"\n"+p.streamKey()+"\n"), 0o644)
 		if err != nil {
 			p.log.Warn("could not remember browser surface", "error", err)
 		}
@@ -354,7 +442,7 @@ func (p *Player) search(ctx context.Context) error {
 	}
 	if len(f.IDs) == 0 {
 		if p.now().Sub(p.phaseSince) > p.cfg.SearchTimeout {
-			p.log.Warn("search page shows no tracks; reloading", "query", p.cfg.Query)
+			p.log.Warn("search page shows no tracks; reloading", "query", p.src.Query)
 			p.setPhase(phaseSearching)
 			return p.b.Goto(ctx, p.surface, p.searchURL())
 		}
@@ -404,9 +492,9 @@ func (p *Player) play(ctx context.Context) error {
 
 // restart loads a fresh stream in the same surface.
 func (p *Player) restart(ctx context.Context) error {
-	if p.cfg.URL != "" {
+	if p.src.URL != "" {
 		p.setPhase(phasePlaying)
-		return p.b.Goto(ctx, p.surface, p.cfg.URL)
+		return p.b.Goto(ctx, p.surface, p.src.URL)
 	}
 	p.setPhase(phaseSearching)
 	return p.b.Goto(ctx, p.surface, p.searchURL())
@@ -415,21 +503,35 @@ func (p *Player) restart(ctx context.Context) error {
 // note records the outcome of a step. Three failures in a row that are not
 // cmux being unreachable or a script error mean the surface is gone, so the
 // player opens a new one.
-func (p *Player) note(err error) {
+func (p *Player) note(ctx context.Context, err error) {
 	if err == nil {
 		p.fails, p.lastErr = 0, ""
+		return
+	}
+	if errors.Is(err, errWaiting) {
 		return
 	}
 	if err.Error() != p.lastErr {
 		p.log.Error("cmux", "error", err)
 	}
 	p.lastErr = err.Error()
-	if errors.Is(err, cmux.ErrUnavailable) || errors.Is(err, cmux.ErrScript) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, cmux.ErrUnavailable) || errors.Is(err, context.Canceled) || p.surface == "" {
+		return
+	}
+	// A page showing a dialog, such as "Leave site?", answers nothing else
+	// until the dialog is dealt with.
+	if ok, _ := p.b.AcceptDialog(ctx, p.surface); ok {
+		p.fails = 0
+		return
+	}
+	if errors.Is(err, cmux.ErrScript) {
 		return
 	}
 	p.fails++
 	if p.fails >= 3 && p.phase != phaseOpening {
 		p.log.Warn("browser surface lost; opening a new one", "surface", p.surface)
+		// Do not leave the old tab behind if it is still there.
+		_ = p.b.Close(ctx, p.surface)
 		p.fails, p.surface = 0, ""
 		p.setPhase(phaseOpening)
 	}

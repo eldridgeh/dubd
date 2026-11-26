@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -18,7 +20,7 @@ type call struct {
 func fake(t *testing.T, calls ...call) *Client {
 	t.Helper()
 	i := 0
-	return &Client{Bin: "cmux", Timeout: time.Second, Run: func(_ context.Context, _ string, args ...string) ([]byte, []byte, error) {
+	return &Client{Bin: "cmux", Timeout: time.Second, DialogDelay: time.Hour, Run: func(_ context.Context, _ string, args ...string) ([]byte, []byte, error) {
 		if i >= len(calls) {
 			t.Fatalf("unexpected call %v", args)
 		}
@@ -90,5 +92,51 @@ func TestErrors(t *testing.T) {
 	err := c.Goto(context.Background(), "s", "u")
 	if err == nil || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrScript) || err.Error() != "not_found: surface gone" {
 		t.Errorf("plain error = %v", err)
+	}
+}
+
+func TestAcceptDialog(t *testing.T) {
+	c := fake(t,
+		call{args: []string{"--json", "browser", "--surface", "s", "dialog", "accept"}, stdout: `{"accepted":true,"dialog":{"type":"alert"}}`},
+		call{stderr: "Error: not_found: No pending dialog", err: errors.New("exit status 1")},
+		call{stderr: "Error: Command timed out", err: errors.New("exit status 1")},
+	)
+	if ok, err := c.AcceptDialog(context.Background(), "s"); !ok || err != nil {
+		t.Fatalf("pending dialog: %v, %v", ok, err)
+	}
+	if ok, err := c.AcceptDialog(context.Background(), "s"); ok || err != nil {
+		t.Fatalf("no dialog: %v, %v", ok, err)
+	}
+	if ok, err := c.AcceptDialog(context.Background(), "s"); ok || err == nil {
+		t.Fatalf("failure: %v, %v", ok, err)
+	}
+}
+
+func TestClose(t *testing.T) {
+	c := fake(t, call{args: []string{"--json", "close-surface", "--surface", "s"}, stdout: `{}`})
+	if err := c.Close(context.Background(), "s"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A navigation held up by "Leave site?" completes once Goto answers it.
+func TestGotoAnswersTheLeaveSiteDialog(t *testing.T) {
+	answered := make(chan struct{})
+	var once sync.Once
+	c := &Client{Bin: "cmux", Timeout: 5 * time.Second, DialogDelay: 5 * time.Millisecond,
+		Run: func(ctx context.Context, _ string, args ...string) ([]byte, []byte, error) {
+			if strings.Contains(strings.Join(args, " "), "dialog accept") {
+				once.Do(func() { close(answered) })
+				return []byte(`{"accepted":true}`), nil, nil
+			}
+			select {
+			case <-answered:
+				return []byte(`{}`), nil, nil
+			case <-ctx.Done():
+				return nil, []byte("Error: Command timed out"), errors.New("exit status 1")
+			}
+		}}
+	if err := c.Goto(context.Background(), "s", "https://example.com/"); err != nil {
+		t.Fatalf("Goto = %v", err)
 	}
 }
