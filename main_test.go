@@ -2,8 +2,25 @@ package main
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+func TestFlagsFirst(t *testing.T) {
+	for _, tc := range []struct{ in, want []string }{
+		{[]string{"3", "-from", "a"}, []string{"-from", "a", "3"}},
+		{[]string{"-from", "a", "3"}, []string{"-from", "a", "3"}},
+		{[]string{"7", "-addr", "127.0.0.1:8401"}, []string{"-addr", "127.0.0.1:8401", "7"}},
+		{[]string{"-addr=127.0.0.1:1", "7"}, []string{"-addr=127.0.0.1:1", "7"}},
+		{[]string{"-2"}, []string{"-2"}}, // a negative metric is a value, not a flag
+		{[]string{"-from", "a", "--", "-2"}, []string{"-from", "a", "--", "-2"}},
+		{nil, nil},
+	} {
+		if got := flagsFirst(tc.in); !reflect.DeepEqual(got, tc.want) && !(len(got) == 0 && len(tc.want) == 0) {
+			t.Errorf("flagsFirst(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
 
 func TestAddrDefault(t *testing.T) {
 	t.Setenv("DUBD_ADDR", "")

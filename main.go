@@ -58,7 +58,12 @@ tempo that follows an integer metric.
 
 Usage:
   dubd run [flags]     start the daemon (from a cmux terminal tab)
-  dubd set <integer>   tell the running daemon the metric
+  dubd set <integer>   tell the running daemon the whole metric
+  dubd set <integer> -from <agent>
+                       report one agent's number; the daemon adds the agents up
+  dubd land [-from <agent>] [count]
+                       report a landing; the daemon works out landings per hour
+  dubd forget <agent>  drop one agent's number
   dubd status          print the running daemon's state
   dubd pause | play    pause or resume the stream
   dubd next            move to another stream
@@ -78,8 +83,8 @@ func main() {
 	switch cmd, args := os.Args[1], os.Args[2:]; cmd {
 	case "run":
 		err = run(args)
-	case "set":
-		err = client(args, "set")
+	case "set", "land", "forget":
+		err = client(args, cmd)
 	case "status":
 		err = client(args, "status")
 	case "pause":
@@ -124,6 +129,10 @@ func run(args []string) error {
 		metricFile = fs.String("metric-file", "", "file that holds the metric; read every -interval")
 		interval   = fs.Duration("interval", 30*time.Second, "how often -metric-cmd or -metric-file is read")
 		staleAfter = fs.Duration("stale-after", 0, "play at rate-min when the metric has not been updated this long (0 never)")
+		settle     = fs.Duration("settle", 10*time.Second, "shortest time between tempo changes, so a burst of reports is one change")
+		combine    = fs.String("combine", "sum", "how agents' numbers become the metric: sum, avg or max")
+		agentTTL   = fs.Duration("agent-ttl", 0, "drop an agent that has not reported for this long (0 never)")
+		window     = fs.Duration("window", time.Hour, "span over which reported landings are counted")
 		cmuxBin    = fs.String("cmux", "", "path to the cmux CLI (default: $PATH, then the cmux app)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -131,6 +140,10 @@ func run(args []string) error {
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	how, err := metric.ParseCombine(*combine)
+	if err != nil {
+		return fmt.Errorf("-%w", err)
 	}
 	curve := tempo.Curve{MetricMin: *metricMin, MetricMax: *metricMax, RateMin: *rateMin, RateMax: *rateMax}
 	if err := curve.Validate(); err != nil {
@@ -141,6 +154,12 @@ func run(args []string) error {
 		return errors.New("use -metric-cmd or -metric-file, not both")
 	case *name != "" && !nameRE.MatchString(*name):
 		return errors.New("-name may use letters, digits, dot, dash and underscore, up to 64 characters")
+	case *settle < 0:
+		return errors.New("-settle must not be negative")
+	case *agentTTL < 0:
+		return errors.New("-agent-ttl must not be negative")
+	case *window < time.Minute:
+		return errors.New("-window must be at least 1m")
 	case *interval < time.Second:
 		return errors.New("-interval must be at least 1s")
 	}
@@ -172,16 +191,18 @@ func run(args []string) error {
 
 	cfg := player.Config{
 		Stream: stream, Curve: curve, KeepPitch: !*tape,
-		StaleAfter: *staleAfter, SurfaceFile: surfaceFile(*name),
+		Settle: *settle, StaleAfter: *staleAfter, SurfaceFile: surfaceFile(*name),
 	}
 	p := player.New(cfg, browser, log, *start)
 	browser.OnDialog = p.NoteDialog
+	board := metric.NewBoard(*start, how, *agentTTL, *window)
+	board.OnChange = p.SetMetric
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("%w (is dubd already running? a second instance needs its own -addr and -name)", err)
 	}
-	srv := &http.Server{Handler: server.New(p, buildVersion()), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: server.New(p, board, buildVersion()), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http", "error", err)
@@ -200,9 +221,24 @@ func run(args []string) error {
 	}
 	if src != nil {
 		go metric.Poll(ctx, src, *interval,
-			func(v int) { p.SetMetric(v, source) },
+			func(v int) { board.Set(v, source) },
 			func(err error) { log.Error("reading metric", "source", source, "error", err) })
 	}
+
+	// Agents that go quiet and landings that leave the window change the
+	// metric with nobody reporting.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				board.Expire()
+			}
+		}
+	}()
 
 	p.Run(ctx) // returns once ctx ends and playback is paused
 	shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -225,12 +261,50 @@ func surfaceFile(name string) string {
 	return filepath.Join(dir, "dubd", "surface."+name)
 }
 
+// flagsFirst moves flags ahead of the other arguments, so that
+// "dubd set 3 -from a" works as well as "dubd set -from a 3". Every flag of
+// the client commands takes a value.
+func flagsFirst(args []string) []string {
+	var flags, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return append(append(flags, "--"), append(rest, args[i+1:]...)...)
+		case len(a) > 1 && a[0] == '-' && !isNumber(a):
+			flags = append(flags, a)
+			if !strings.Contains(a, "=") && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return append(flags, rest...)
+}
+
+func isNumber(s string) bool {
+	_, err := metric.Parse(s)
+	return err == nil
+}
+
 // client sends one request to the running daemon and prints the answer.
 func client(args []string, cmd string) error {
 	fs := flag.NewFlagSet("dubd "+cmd, flag.ContinueOnError)
 	addr := fs.String("addr", addrDefault(), "address of the running daemon; $DUBD_ADDR sets the default")
+	from := ""
+	if cmd == "set" || cmd == "land" {
+		fs.StringVar(&from, "from", "", "the agent reporting")
+	}
+	if cmd != "stream" { // a stream's words are taken as they come
+		args = flagsFirst(args)
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if from != "" && !metric.ValidAgent(from) {
+		return errors.New("-from may use letters, digits, dot, dash and underscore, up to 64 characters")
 	}
 	method, path, body := http.MethodPost, "/"+cmd, ""
 	switch cmd {
@@ -238,12 +312,33 @@ func client(args []string, cmd string) error {
 		method = http.MethodGet
 	case "set":
 		if fs.NArg() != 1 {
-			return errors.New("usage: dubd set [-addr host:port] <integer>")
+			return errors.New("usage: dubd set [-addr host:port] [-from agent] <integer>")
 		}
 		if _, err := metric.Parse(fs.Arg(0)); err != nil {
 			return err
 		}
 		method, path, body = http.MethodPut, "/metric", fs.Arg(0)
+		if from != "" {
+			path += "/" + from
+		}
+	case "land":
+		if fs.NArg() > 1 {
+			return errors.New("usage: dubd land [-addr host:port] [-from agent] [count]")
+		}
+		if fs.NArg() == 1 {
+			if _, err := metric.Parse(fs.Arg(0)); err != nil {
+				return err
+			}
+			body = fs.Arg(0)
+		}
+		if from != "" {
+			path += "/" + from
+		}
+	case "forget":
+		if fs.NArg() != 1 || !metric.ValidAgent(fs.Arg(0)) {
+			return errors.New("usage: dubd forget [-addr host:port] <agent>")
+		}
+		method, path = http.MethodDelete, "/metric/"+fs.Arg(0)
 	case "stream":
 		body = strings.Join(fs.Args(), " ")
 		if _, err := player.ParseStream(body); err != nil {
@@ -251,7 +346,7 @@ func client(args []string, cmd string) error {
 		}
 		method = http.MethodPut
 	}
-	if cmd != "set" && cmd != "stream" && fs.NArg() > 0 {
+	if (cmd == "status" || cmd == "pause" || cmd == "play" || cmd == "next") && fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
 	req, err := http.NewRequest(method, "http://"+*addr+path, strings.NewReader(body))
