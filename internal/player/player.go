@@ -5,6 +5,7 @@ package player
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/url"
@@ -25,12 +26,42 @@ type Browser interface {
 	Eval(ctx context.Context, surface, script string, out any) error
 }
 
+// Stream says what to play: a YouTube or YouTube Music URL, or, when URL is
+// empty, a YouTube Music search whose top results' radios are played.
+type Stream struct {
+	URL   string `json:"url,omitempty"`
+	Query string `json:"query,omitempty"`
+}
+
+// ParseStream reads a stream from text: a link, or search words. A link to
+// a playlist page, which does not play by itself, becomes the link that
+// plays that playlist.
+func ParseStream(text string) (Stream, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return Stream{}, errors.New("no link or search words given")
+	}
+	if !strings.HasPrefix(text, "http://") && !strings.HasPrefix(text, "https://") {
+		return Stream{Query: text}, nil
+	}
+	u, err := url.Parse(text)
+	if err != nil {
+		return Stream{}, fmt.Errorf("not a usable link: %w", err)
+	}
+	host := strings.ToLower(u.Hostname())
+	if u.Scheme != "https" || (host != "youtube.com" && !strings.HasSuffix(host, ".youtube.com")) {
+		return Stream{}, errors.New("the link must be an https youtube.com or music.youtube.com link")
+	}
+	if list := u.Query().Get("list"); u.Path == "/playlist" && list != "" {
+		u.Path, u.RawQuery = "/watch", url.Values{"list": {list}}.Encode()
+	}
+	return Stream{URL: u.String()}, nil
+}
+
 // Config is the player's settings.
 type Config struct {
-	// URL plays a specific YouTube Music page. When empty, the player
-	// searches YouTube Music for Query and plays the radio of a result.
-	URL   string
-	Query string
+	// Stream is what to play at the start.
+	Stream Stream
 
 	Curve     tempo.Curve
 	KeepPitch bool
@@ -81,6 +112,7 @@ type Status struct {
 	Rate          float64   `json:"rate"`
 	Phase         string    `json:"phase"`
 	Paused        bool      `json:"paused"`
+	Stream        Stream    `json:"stream"`
 	Ad            bool      `json:"ad"`
 	SignedIn      bool      `json:"signed_in"`
 	Surface       string    `json:"surface,omitempty"`
@@ -105,11 +137,13 @@ type Player struct {
 	metricAt     time.Time
 	paused       bool
 	next         bool
+	stream       Stream
 
 	status Status // published by the loop after every step
 
 	// The fields below belong to the loop goroutine alone.
 	pausedNow    bool
+	src          Stream // the stream the loop is working on
 	phase        string
 	phaseSince   time.Time
 	surface      string
@@ -132,6 +166,7 @@ func New(cfg Config, b Browser, log *slog.Logger, metric int) *Player {
 	p := &Player{cfg: cfg, b: b, log: log, now: time.Now, phase: phaseOpening}
 	p.metric, p.metricSource, p.metricAt = metric, "start", p.now()
 	p.status = Status{Phase: phaseOpening}
+	p.stream, p.src = cfg.Stream, cfg.Stream
 	return p
 }
 
@@ -161,6 +196,13 @@ func (p *Player) Next() {
 	p.next = true
 }
 
+// SetStream switches to another stream.
+func (p *Player) SetStream(s Stream) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stream, p.next = s, true
+}
+
 // target is the rate the current metric calls for. Caller holds mu.
 func (p *Player) target() (rate float64, stale bool) {
 	stale = p.cfg.StaleAfter > 0 && p.now().Sub(p.metricAt) > p.cfg.StaleAfter
@@ -177,7 +219,7 @@ func (p *Player) Status() Status {
 	s := p.status
 	s.Metric, s.MetricSource, s.MetricUpdated = p.metric, p.metricSource, p.metricAt
 	s.TargetRate, s.MetricStale = p.target()
-	s.Paused = p.paused
+	s.Paused, s.Stream = p.paused, p.stream
 	return s
 }
 
@@ -223,12 +265,12 @@ func (p *Player) stop() {
 }
 
 func (p *Player) searchURL() string {
-	return "https://music.youtube.com/search?q=" + url.QueryEscape(p.cfg.Query)
+	return "https://music.youtube.com/search?q=" + url.QueryEscape(p.src.Query)
 }
 
 func (p *Player) startURL() string {
-	if p.cfg.URL != "" {
-		return p.cfg.URL
+	if p.src.URL != "" {
+		return p.src.URL
 	}
 	return p.searchURL()
 }
@@ -256,7 +298,14 @@ func (p *Player) Step(ctx context.Context) {
 	paused := p.paused
 	next := p.next
 	p.next = false
+	switched := p.src != p.stream
+	if switched {
+		p.src, p.pick, p.seed = p.stream, 0, ""
+	}
 	p.mu.Unlock()
+	if switched {
+		p.saveSurface()
+	}
 	if p.pausedNow && !paused {
 		p.lastProgress = p.now() // resuming is not a stall
 	}
@@ -268,18 +317,16 @@ func (p *Player) Step(ctx context.Context) {
 	p.rate = target
 
 	var err error
-	switch p.phase {
-	case phaseOpening:
+	switch {
+	case p.phase == phaseOpening:
 		err = p.open(ctx)
-	case phaseSearching:
+	case next:
+		p.log.Info("starting another stream", "url", p.src.URL, "query", p.src.Query)
+		err = p.restart(ctx)
+	case p.phase == phaseSearching:
 		err = p.search(ctx)
-	case phasePlaying:
-		if next {
-			p.log.Info("moving to the next stream")
-			err = p.restart(ctx)
-		} else {
-			err = p.play(ctx)
-		}
+	case p.phase == phasePlaying:
+		err = p.play(ctx)
 	}
 	p.note(err)
 }
@@ -302,7 +349,7 @@ func (p *Player) open(ctx context.Context) error {
 	p.surface = surface
 	p.saveSurface()
 	p.log.Info("opened browser surface", "surface", surface, "url", p.startURL())
-	if p.cfg.URL != "" {
+	if p.src.URL != "" {
 		p.setPhase(phasePlaying)
 	} else {
 		p.setPhase(phaseSearching)
@@ -317,7 +364,7 @@ func (p *Player) adopt(ctx context.Context) bool {
 		return false
 	}
 	raw, err := os.ReadFile(p.cfg.SurfaceFile)
-	surface := strings.TrimSpace(string(raw))
+	surface, was, _ := strings.Cut(strings.TrimSpace(string(raw)), "\n")
 	if err != nil || surface == "" {
 		return false
 	}
@@ -332,15 +379,31 @@ func (p *Player) adopt(ctx context.Context) bool {
 	// Give it a few seconds to show it is playing before starting over.
 	p.lastProgress = p.now().Add(5*time.Second - p.cfg.StallAfter)
 	p.log.Info("reusing browser surface", "surface", surface)
+	if was != p.streamKey() {
+		// The tab is playing what an earlier run was asked for.
+		p.saveSurface()
+		if err := p.restart(ctx); err != nil {
+			p.log.Error("cmux", "error", err)
+		}
+	}
 	return true
 }
 
+// streamKey identifies the stream in the surface file.
+func (p *Player) streamKey() string {
+	if p.src.URL != "" {
+		return p.src.URL
+	}
+	return "search: " + p.src.Query
+}
+
+// saveSurface records the surface and the stream it was given.
 func (p *Player) saveSurface() {
-	if p.cfg.SurfaceFile == "" {
+	if p.cfg.SurfaceFile == "" || p.surface == "" {
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(p.cfg.SurfaceFile), 0o755); err == nil {
-		err = os.WriteFile(p.cfg.SurfaceFile, []byte(p.surface+"\n"), 0o644)
+		err = os.WriteFile(p.cfg.SurfaceFile, []byte(p.surface+"\n"+p.streamKey()+"\n"), 0o644)
 		if err != nil {
 			p.log.Warn("could not remember browser surface", "error", err)
 		}
@@ -354,7 +417,7 @@ func (p *Player) search(ctx context.Context) error {
 	}
 	if len(f.IDs) == 0 {
 		if p.now().Sub(p.phaseSince) > p.cfg.SearchTimeout {
-			p.log.Warn("search page shows no tracks; reloading", "query", p.cfg.Query)
+			p.log.Warn("search page shows no tracks; reloading", "query", p.src.Query)
 			p.setPhase(phaseSearching)
 			return p.b.Goto(ctx, p.surface, p.searchURL())
 		}
@@ -404,9 +467,9 @@ func (p *Player) play(ctx context.Context) error {
 
 // restart loads a fresh stream in the same surface.
 func (p *Player) restart(ctx context.Context) error {
-	if p.cfg.URL != "" {
+	if p.src.URL != "" {
 		p.setPhase(phasePlaying)
-		return p.b.Goto(ctx, p.surface, p.cfg.URL)
+		return p.b.Goto(ctx, p.surface, p.src.URL)
 	}
 	p.setPhase(phaseSearching)
 	return p.b.Goto(ctx, p.surface, p.searchURL())

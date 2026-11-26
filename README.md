@@ -73,8 +73,25 @@ dubd run -metric-file ~/.landings            # dubd reads a file every 30s
 ```
 
 `dubd status` prints the metric, the playback rate and what is playing.
-`dubd pause` and `dubd play` stop and resume the stream. `dubd next` moves
-to another stream when the current one is not to your taste.
+`dubd pause` and `dubd play` stop and resume the stream.
+
+## Choosing the music
+
+By default `dubd` searches YouTube Music for "ai dub reggae" and plays the
+radio of a top result. Play anything else, at start or while it runs:
+
+```sh
+dubd run -query 'heavy dub techno'                 # a different search
+dubd run -url 'https://music.youtube.com/playlist?list=...'   # your playlist
+
+dubd stream heavy dub techno                       # switch while running
+dubd stream 'https://music.youtube.com/playlist?list=...'
+dubd next                                          # another result of the same search
+```
+
+A link can be a playlist, an album or a single track on YouTube Music or
+YouTube. A playlist that ends starts again from the top. A private playlist
+needs the tab signed in to the account that owns it.
 
 ## Adverts and signing in
 
@@ -122,7 +139,7 @@ difference easier to hear from across the room.
 | Flag           | Default          | Meaning                                                              |
 | -------------- | ---------------- | -------------------------------------------------------------------- |
 | `-query`       | `ai dub reggae`  | YouTube Music search; the stream is the radio of a top result        |
-| `-url`         |                  | Play this YouTube Music URL (a playlist, say) instead of searching   |
+| `-url`         |                  | Play this YouTube Music link (playlist, album, track), not a search  |
 | `-metric`      | `0`              | Metric value to start with                                           |
 | `-metric-min`  | `0`              | Metric value that plays at `-rate-min`                               |
 | `-metric-max`  | `12`             | Metric value that plays at `-rate-max`                               |
@@ -148,6 +165,7 @@ The API listens on localhost only.
 | `POST /pause`        | Pause the stream                                   |
 | `POST /play`         | Resume the stream                                  |
 | `POST /next`         | Move to another stream                             |
+| `PUT /stream`        | Play something else; the body is a link or search words (or `POST`) |
 
 ## Notes
 

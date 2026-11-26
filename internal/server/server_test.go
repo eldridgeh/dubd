@@ -15,9 +15,11 @@ type fakePlayer struct {
 	source string
 	paused bool
 	nexts  int
+	stream player.Stream
 }
 
-func (f *fakePlayer) Next() { f.nexts++ }
+func (f *fakePlayer) Next()                     { f.nexts++ }
+func (f *fakePlayer) SetStream(s player.Stream) { f.stream = s }
 
 func (f *fakePlayer) SetMetric(v int, source string) { f.metric, f.source = v, source }
 func (f *fakePlayer) SetPaused(paused bool)          { f.paused = paused }
@@ -75,6 +77,20 @@ func TestPausePlayStatus(t *testing.T) {
 	}
 	if w := do(t, h, "GET", "/pause", ""); w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /pause = %d", w.Code)
+	}
+}
+
+func TestStream(t *testing.T) {
+	p := &fakePlayer{}
+	h := New(p, "test")
+	if w := do(t, h, "PUT", "/stream", "heavy dub techno\n"); w.Code != 200 || p.stream.Query != "heavy dub techno" {
+		t.Fatalf("search words: code %d stream %+v", w.Code, p.stream)
+	}
+	if w := do(t, h, "POST", "/stream", "https://music.youtube.com/playlist?list=PL123"); w.Code != 200 || p.stream.URL != "https://music.youtube.com/watch?list=PL123" {
+		t.Fatalf("link: code %d stream %+v", w.Code, p.stream)
+	}
+	if w := do(t, h, "PUT", "/stream", "https://example.com/x"); w.Code != 400 || p.stream.URL != "https://music.youtube.com/watch?list=PL123" {
+		t.Fatalf("foreign link: code %d stream %+v", w.Code, p.stream)
 	}
 }
 

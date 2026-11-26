@@ -112,7 +112,7 @@ func steps(p *Player, c *clock, n int) {
 
 func TestSearchThenRadio(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
-	p, c := newTest(t, Config{Query: "ai dub reggae"}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "ai dub reggae"}}, f, 5)
 	steps(p, c, 4)
 
 	if len(f.opened) != 1 || f.opened[0] != "https://music.youtube.com/search?q=ai+dub+reggae" {
@@ -130,7 +130,7 @@ func TestSearchThenRadio(t *testing.T) {
 func TestDirectURL(t *testing.T) {
 	f := &fakeBrowser{}
 	u := "https://music.youtube.com/watch?v=ccccccccccc&list=PL123"
-	p, c := newTest(t, Config{URL: u}, f, 0)
+	p, c := newTest(t, Config{Stream: Stream{URL: u}}, f, 0)
 	steps(p, c, 3)
 	if len(f.opened) != 1 || f.opened[0] != u || len(f.gotos) != 0 || p.Status().Phase != phasePlaying {
 		t.Fatalf("opened = %q gotos = %q", f.opened, f.gotos)
@@ -139,7 +139,7 @@ func TestDirectURL(t *testing.T) {
 
 func TestRateFollowsMetricInOneChange(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q"}, f, 0)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}}, f, 0)
 	steps(p, c, 3)
 	if f.last.Rate != 0.5 {
 		t.Fatalf("starting rate = %v", f.last.Rate)
@@ -157,10 +157,10 @@ func TestRateFollowsMetricInOneChange(t *testing.T) {
 func TestNextAfterReusingATabMovesOn(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "surface")
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
-	p, c := newTest(t, Config{Query: "q", SurfaceFile: file}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
 	steps(p, c, 4)
 
-	p2, c2 := newTest(t, Config{Query: "q", SurfaceFile: file}, f, 5)
+	p2, c2 := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
 	steps(p2, c2, 2)
 	p2.Next()
 	steps(p2, c2, 3)
@@ -172,7 +172,7 @@ func TestNextAfterReusingATabMovesOn(t *testing.T) {
 func TestKeepPitch(t *testing.T) {
 	for _, keep := range []bool{true, false} {
 		f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-		p, c := newTest(t, Config{Query: "q", KeepPitch: keep}, f, 0)
+		p, c := newTest(t, Config{Stream: Stream{Query: "q"}, KeepPitch: keep}, f, 0)
 		steps(p, c, 3)
 		if f.last.KeepPitch != keep {
 			t.Errorf("keepPitch = %v, want %v", f.last.KeepPitch, keep)
@@ -182,7 +182,7 @@ func TestKeepPitch(t *testing.T) {
 
 func TestStallRestartsWithNextTrack(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
-	p, c := newTest(t, Config{Query: "q", StallAfter: 10 * time.Second}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, StallAfter: 10 * time.Second}, f, 5)
 	steps(p, c, 5)
 	f.stuck = true
 	steps(p, c, 14)
@@ -199,7 +199,7 @@ func TestStallRestartsWithNextTrack(t *testing.T) {
 
 func TestNextStartsAnotherStream(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
-	p, c := newTest(t, Config{Query: "q"}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}}, f, 5)
 	steps(p, c, 4)
 	p.Next()
 	steps(p, c, 3)
@@ -211,7 +211,7 @@ func TestNextStartsAnotherStream(t *testing.T) {
 
 func TestAdvertIsReported(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}, ad: true}
-	p, c := newTest(t, Config{Query: "q"}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}}, f, 5)
 	steps(p, c, 4)
 	if !p.Status().Ad {
 		t.Fatal("advert not reported")
@@ -225,7 +225,7 @@ func TestAdvertIsReported(t *testing.T) {
 
 func TestPauseIsNotAStall(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q", StallAfter: 10 * time.Second}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, StallAfter: 10 * time.Second}, f, 5)
 	steps(p, c, 4)
 	p.SetPaused(true)
 	steps(p, c, 30)
@@ -241,7 +241,7 @@ func TestPauseIsNotAStall(t *testing.T) {
 
 func TestLostSurfaceIsReopened(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q", ReopenAfter: 5 * time.Second}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, ReopenAfter: 5 * time.Second}, f, 5)
 	steps(p, c, 4)
 	f.gone = true
 	steps(p, c, 10)
@@ -252,7 +252,7 @@ func TestLostSurfaceIsReopened(t *testing.T) {
 
 func TestUnreachableCmuxOpensNothingExtra(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q", ReopenAfter: 5 * time.Second}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, ReopenAfter: 5 * time.Second}, f, 5)
 	steps(p, c, 4)
 	f.err = cmux.ErrUnavailable
 	steps(p, c, 30)
@@ -268,7 +268,7 @@ func TestUnreachableCmuxOpensNothingExtra(t *testing.T) {
 
 func TestStaleMetricFallsToMinimum(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q", StaleAfter: time.Minute}, f, 10)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, StaleAfter: time.Minute}, f, 10)
 	steps(p, c, 5)
 	if f.last.Rate != 1.5 {
 		t.Fatalf("rate = %v", f.last.Rate)
@@ -287,17 +287,17 @@ func TestStaleMetricFallsToMinimum(t *testing.T) {
 func TestSurfaceIsReusedAcrossRuns(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "state", "surface")
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q", SurfaceFile: file}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
 	steps(p, c, 4)
 
-	p2, c2 := newTest(t, Config{Query: "q", SurfaceFile: file}, f, 5)
+	p2, c2 := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
 	steps(p2, c2, 4)
 	if len(f.opened) != 1 || p2.Status().Surface != "surface:1" || p2.Status().Phase != phasePlaying {
 		t.Fatalf("opened = %d status = %+v", len(f.opened), p2.Status())
 	}
 
 	f.gone = true
-	p3, c3 := newTest(t, Config{Query: "q", SurfaceFile: file}, f, 5)
+	p3, c3 := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
 	steps(p3, c3, 4)
 	if len(f.opened) != 2 || p3.Status().Surface != "surface:2" {
 		t.Fatalf("opened = %d status = %+v", len(f.opened), p3.Status())
@@ -306,10 +306,86 @@ func TestSurfaceIsReusedAcrossRuns(t *testing.T) {
 
 func TestStopPauses(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q"}, f, 5)
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}}, f, 5)
 	steps(p, c, 4)
 	p.stop()
 	if f.last.Play {
 		t.Fatal("stop did not pause playback")
+	}
+}
+
+func TestParseStream(t *testing.T) {
+	for in, want := range map[string]Stream{
+		"heavy dub techno": {Query: "heavy dub techno"},
+		"  slopcore dub\n": {Query: "slopcore dub"},
+		"https://music.youtube.com/playlist?list=PL123":            {URL: "https://music.youtube.com/watch?list=PL123"},
+		"https://www.youtube.com/playlist?list=PL123&si=x":         {URL: "https://www.youtube.com/watch?list=PL123"},
+		"https://music.youtube.com/watch?v=aaaaaaaaaaa&list=PL123": {URL: "https://music.youtube.com/watch?v=aaaaaaaaaaa&list=PL123"},
+	} {
+		if got, err := ParseStream(in); err != nil || got != want {
+			t.Errorf("ParseStream(%q) = %+v, %v; want %+v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "   ", "https://example.com/watch?v=x", "http://music.youtube.com/watch?v=x", "https://notyoutube.com/x", "https://evil.example/music.youtube.com"} {
+		if got, err := ParseStream(in); err == nil {
+			t.Errorf("ParseStream(%q) = %+v, want an error", in, got)
+		}
+	}
+}
+
+func TestSetStreamSwitches(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}}, f, 5)
+	steps(p, c, 4)
+
+	link := "https://music.youtube.com/watch?list=PL123"
+	p.SetStream(Stream{URL: link})
+	steps(p, c, 3)
+	if got := f.gotos[len(f.gotos)-1]; got != link || p.Status().Stream.URL != link || p.Status().Phase != phasePlaying {
+		t.Fatalf("after a link: last goto %q status %+v", got, p.Status())
+	}
+
+	p.SetStream(Stream{Query: "other words"})
+	steps(p, c, 3)
+	n := len(f.gotos)
+	if f.gotos[n-2] != "https://music.youtube.com/search?q=other+words" || f.gotos[n-1] != radioURL("aaaaaaaaaaa") {
+		t.Fatalf("after search words: gotos %q", f.gotos[n-2:])
+	}
+	if len(f.opened) != 1 {
+		t.Fatalf("opened %d surfaces, want 1", len(f.opened))
+	}
+}
+
+func TestReusedTabSwitchesToTheNewStream(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "surface")
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
+	steps(p, c, 4)
+
+	link := "https://music.youtube.com/watch?list=PL123"
+	p2, c2 := newTest(t, Config{Stream: Stream{URL: link}, SurfaceFile: file}, f, 5)
+	steps(p2, c2, 3)
+	if len(f.opened) != 1 || f.gotos[len(f.gotos)-1] != link {
+		t.Fatalf("opened %d, gotos %q", len(f.opened), f.gotos)
+	}
+
+	// The same stream again leaves the tab playing.
+	n := len(f.gotos)
+	p3, c3 := newTest(t, Config{Stream: Stream{URL: link}, SurfaceFile: file}, f, 5)
+	steps(p3, c3, 3)
+	if len(f.gotos) != n {
+		t.Fatalf("reloaded a tab that was already playing the stream: %q", f.gotos[n:])
+	}
+}
+
+func TestSetStreamWhileSearching(t *testing.T) {
+	f := &fakeBrowser{} // the search page shows nothing yet
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}}, f, 5)
+	steps(p, c, 2)
+	link := "https://music.youtube.com/watch?list=PL123"
+	p.SetStream(Stream{URL: link})
+	steps(p, c, 2)
+	if len(f.gotos) != 1 || f.gotos[0] != link || p.Status().Phase != phasePlaying {
+		t.Fatalf("gotos %q status %+v", f.gotos, p.Status())
 	}
 }
