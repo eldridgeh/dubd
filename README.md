@@ -63,7 +63,10 @@ commands from processes started in its own terminals.
 dubd run
 ```
 
-Then feed it the number, whichever way suits:
+Then feed it the number. There are three ways, and one instance takes all
+of them; whichever was used last is the one in force.
+
+**1. You have the total.** Send one number:
 
 ```sh
 dubd set 7                                   # from any terminal
@@ -71,6 +74,35 @@ curl -X PUT -d 7 http://127.0.0.1:8382/metric   # from anything that speaks HTTP
 dubd run -metric-cmd 'landings-per-hour'     # dubd runs a command every 30s
 dubd run -metric-file ~/.landings            # dubd reads a file every 30s
 ```
+
+**2. Each agent has its own number.** Every agent reports its own and
+`dubd` adds them up:
+
+```sh
+dubd set 3 -from agent-12
+curl -X PUT -d 3 http://127.0.0.1:8382/metric/agent-12
+dubd forget agent-12                         # drop an agent
+```
+
+`-combine avg` or `-combine max` on `dubd run` averages or takes the highest
+instead of adding. `-agent-ttl 15m` drops an agent that has not reported for
+that long.
+
+**3. Nobody has a number.** Every agent reports each landing as it happens,
+and `dubd` works out landings per hour over the last hour:
+
+```sh
+dubd land -from agent-12                     # one landing
+dubd land                                    # no agent named
+curl -X POST http://127.0.0.1:8382/land/agent-12
+```
+
+`-window 15m` on `dubd run` counts over a shorter span, still as a rate per
+hour.
+
+`dubd status` shows which way is in force and what each agent contributes.
+Many agents can report at once. The tempo changes at most once every
+`-settle` (10 seconds by default), so a burst of reports is one change.
 
 `dubd status` prints the metric, the playback rate and what is playing.
 `dubd pause` and `dubd play` stop and resume the stream.
@@ -92,6 +124,28 @@ dubd next                                          # another result of the same 
 A link can be a playlist, an album or a single track on YouTube Music or
 YouTube. A playlist that ends starts again from the top. A private playlist
 needs the tab signed in to the account that owns it.
+
+## Several instances
+
+To give each agent, team or project its own music, run one instance each.
+Give every instance its own name and port; a name keeps that instance's
+browser tab separate from the others'.
+
+```sh
+dubd run -name alpha -addr 127.0.0.1:8401 -query 'ai dub reggae'
+dubd run -name beta  -addr 127.0.0.1:8402 -query 'heavy dub techno'
+```
+
+Point each sender at its own instance with `-addr`, or once with the
+`DUBD_ADDR` environment variable:
+
+```sh
+dubd set 7 -addr 127.0.0.1:8401
+DUBD_ADDR=127.0.0.1:8402 dubd set 3
+```
+
+Each instance is one playing tab, so instances on the same machine are all
+heard at once.
 
 ## Adverts and signing in
 
@@ -125,7 +179,7 @@ The defaults:
 Change the range with `-metric-min`, `-metric-max`, `-rate-min` and
 `-rate-max`. Rates from 0.25x to 4x are accepted.
 
-The rate changes once per change of the metric, with a half-second dip in
+The rate changes in one step when the metric changes, with a half-second dip in
 volume around it. The browser engine cmux uses (WebKit) drops the audio for a
 moment whenever the playback rate changes; the dip puts that drop in silence,
 so a tempo change sounds like a short swell and not a skip.
@@ -150,7 +204,12 @@ difference easier to hear from across the room.
 | `-metric-file` |                  | File that holds the metric                                           |
 | `-interval`    | `30s`            | How often the command or file is read                                |
 | `-stale-after` | `0` (never)      | Drop to `-rate-min` when the metric has not been updated this long   |
-| `-addr`        | `127.0.0.1:8382` | Address the HTTP API listens on                                      |
+| `-settle`      | `10s`            | Shortest time between tempo changes                                  |
+| `-combine`     | `sum`            | How agents' numbers become the metric: `sum`, `avg` or `max`         |
+| `-agent-ttl`   | `0` (never)      | Drop an agent that has not reported for this long                    |
+| `-window`      | `1h`             | Span over which reported landings are counted                        |
+| `-addr`        | `127.0.0.1:8382` | Address the HTTP API listens on; `$DUBD_ADDR` changes the default    |
+| `-name`        |                  | Name of this instance when running several; keeps its tab separate   |
 | `-cmux`        |                  | Path to the cmux CLI; by default `$PATH`, then the cmux app          |
 
 ## HTTP API
@@ -161,7 +220,11 @@ The API listens on localhost only.
 | -------------------- | -------------------------------------------------- |
 | `GET /status`        | State as JSON                                      |
 | `GET /metric`        | The metric as plain text                           |
-| `PUT /metric`        | Set the metric; the body is an integer (or `POST`) |
+| `PUT /metric`        | Set the whole metric; the body is an integer (or `POST`) |
+| `PUT /metric/{agent}` | Set one agent's number (or `POST`)                |
+| `DELETE /metric/{agent}` | Forget one agent                               |
+| `POST /land`         | Count one landing; a body gives a count            |
+| `POST /land/{agent}` | Count a landing for an agent                       |
 | `POST /pause`        | Pause the stream                                   |
 | `POST /play`         | Resume the stream                                  |
 | `POST /next`         | Move to another stream                             |

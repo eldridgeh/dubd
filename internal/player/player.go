@@ -69,6 +69,9 @@ type Config struct {
 
 	Curve     tempo.Curve
 	KeepPitch bool
+	// Settle is the shortest time between changes of playback rate, so
+	// that a burst of reports is one change of tempo. Zero does not wait.
+	Settle time.Duration
 	// Tick is how often the page is checked and corrected.
 	Tick time.Duration
 	// StallAfter restarts the stream when playback has not advanced this long.
@@ -149,8 +152,9 @@ type Player struct {
 
 	// The fields below belong to the loop goroutine alone.
 	pausedNow    bool
-	pending      bool   // a new stream is still to be loaded
-	src          Stream // the stream the loop is working on
+	pending      bool      // a new stream is still to be loaded
+	rateAt       time.Time // when the rate last changed
+	src          Stream    // the stream the loop is working on
 	phase        string
 	phaseSince   time.Time
 	surface      string
@@ -328,8 +332,11 @@ func (p *Player) Step(ctx context.Context) {
 	defer p.publish()
 
 	// One rate change per metric change: every change costs an audible
-	// hiccup in WebKit, so the rate is not ramped.
-	p.rate = target
+	// hiccup in WebKit, so the rate is not ramped, and changes are kept at
+	// least Settle apart.
+	if target != p.rate && (p.rate == 0 || p.now().Sub(p.rateAt) >= p.cfg.Settle) {
+		p.rate, p.rateAt = target, p.now()
+	}
 
 	var err error
 	switch {

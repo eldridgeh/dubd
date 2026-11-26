@@ -476,3 +476,33 @@ func TestOpenFailureStaysReported(t *testing.T) {
 		t.Fatalf("error while waiting to retry = %q", got)
 	}
 }
+
+func TestRateSettlesBetweenChanges(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, Settle: 10 * time.Second}, f, 0)
+	steps(p, c, 3) // the first rate is applied at once
+	if f.last.Rate != 0.5 {
+		t.Fatalf("starting rate = %v", f.last.Rate)
+	}
+	// A burst of reports within the settle time is not followed one by one.
+	for _, m := range []int{2, 9, 4, 10} {
+		p.SetMetric(m, "test")
+		steps(p, c, 1)
+		if f.last.Rate != 0.5 {
+			t.Fatalf("rate moved to %v during the settle time", f.last.Rate)
+		}
+	}
+	steps(p, c, 5) // 12s since the first rate
+	if f.last.Rate != 1.5 || p.Status().TargetRate != 1.5 {
+		t.Fatalf("after settling: rate %v, want 1.5 (the latest metric)", f.last.Rate)
+	}
+	p.SetMetric(0, "test")
+	steps(p, c, 3)
+	if f.last.Rate != 1.5 {
+		t.Fatalf("rate moved to %v only 3s after the last change", f.last.Rate)
+	}
+	steps(p, c, 8)
+	if f.last.Rate != 0.5 {
+		t.Fatalf("rate = %v, want 0.5 once settled", f.last.Rate)
+	}
+}
