@@ -23,6 +23,7 @@ type fakeBrowser struct {
 	url    string
 	ids    []string // tracks the search page shows
 	stuck  bool     // playback does not advance
+	ad     bool     // an advert is showing
 	gone   bool     // the surface no longer exists
 	err    error    // every call fails with this
 	pos    float64
@@ -69,7 +70,7 @@ func (f *fakeBrowser) Eval(_ context.Context, _ string, script string, out any) 
 			f.pos += f.last.Rate
 		}
 		res = page{Host: "music.youtube.com", Path: "/watch", Video: watching, Loaded: watching,
-			Paused: !f.last.Play, Rate: f.last.Rate, Time: f.pos, Title: "Track"}
+			Paused: !f.last.Play, Rate: f.last.Rate, Time: f.pos, Title: "Track", Ad: f.ad}
 	} else {
 		ids := f.ids
 		if !strings.Contains(f.url, "/search") {
@@ -178,6 +179,32 @@ func TestStallRestartsWithNextTrack(t *testing.T) {
 	}
 	if len(f.opened) != 1 {
 		t.Fatalf("opened %d surfaces, want 1", len(f.opened))
+	}
+}
+
+func TestNextStartsAnotherStream(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
+	p, c := newTest(t, Config{Query: "q"}, f, 5)
+	steps(p, c, 4)
+	p.Next()
+	steps(p, c, 3)
+	want := []string{radioURL("aaaaaaaaaaa"), "https://music.youtube.com/search?q=q", radioURL("bbbbbbbbbbb")}
+	if strings.Join(f.gotos, " ") != strings.Join(want, " ") || p.Status().Phase != phasePlaying {
+		t.Fatalf("gotos = %q", f.gotos)
+	}
+}
+
+func TestAdvertIsReported(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}, ad: true}
+	p, c := newTest(t, Config{Query: "q"}, f, 5)
+	steps(p, c, 4)
+	if !p.Status().Ad {
+		t.Fatal("advert not reported")
+	}
+	f.ad = false
+	steps(p, c, 1)
+	if p.Status().Ad {
+		t.Fatal("advert still reported")
 	}
 }
 

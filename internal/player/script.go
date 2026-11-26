@@ -22,6 +22,8 @@ type page struct {
 	Host     string  `json:"host"`
 	Path     string  `json:"path"`
 	Video    bool    `json:"video"`
+	Ad       bool    `json:"ad"`
+	SignedIn bool    `json:"signedIn"`
 	Loaded   bool    `json:"loaded"`
 	Paused   bool    `json:"paused"`
 	Rate     float64 `json:"rate"`
@@ -43,6 +45,13 @@ const tickJS = `(() => {
   for (const b of document.querySelectorAll('ytmusic-you-there-renderer button, yt-confirm-dialog-renderer #confirm-button button')) {
     if (b.offsetParent !== null) b.click();
   }
+  // An advert: take the skip button when YouTube offers one.
+  out.ad = !!document.querySelector('.ad-showing, .ad-interrupting');
+  if (out.ad) {
+    for (const b of document.querySelectorAll('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern')) {
+      if (b.offsetParent !== null) b.click();
+    }
+  }
   const v = document.querySelector('video');
   if (v) {
     out.video = true;
@@ -56,6 +65,7 @@ const tickJS = `(() => {
     out.time = v.currentTime || 0;
     out.duration = isFinite(v.duration) ? v.duration : 0;
   }
+  out.signedIn = !document.querySelector('ytmusic-nav-bar a.sign-in-link, a[href*="accounts.google.com/ServiceLogin"]');
   out.title = text('ytmusic-player-bar .title') || document.title;
   out.artist = text('ytmusic-player-bar .byline a');
   return JSON.stringify(out);

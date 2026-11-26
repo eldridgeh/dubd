@@ -14,7 +14,10 @@ type fakePlayer struct {
 	metric int
 	source string
 	paused bool
+	nexts  int
 }
+
+func (f *fakePlayer) Next() { f.nexts++ }
 
 func (f *fakePlayer) SetMetric(v int, source string) { f.metric, f.source = v, source }
 func (f *fakePlayer) SetPaused(paused bool)          { f.paused = paused }
@@ -66,6 +69,9 @@ func TestPausePlayStatus(t *testing.T) {
 	}
 	if w := do(t, h, "GET", "/status", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"phase": "playing"`) {
 		t.Fatalf("status = %d %s", w.Code, w.Body)
+	}
+	if do(t, h, "POST", "/next", ""); p.nexts != 1 {
+		t.Fatal("next not passed on")
 	}
 	if w := do(t, h, "GET", "/pause", ""); w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /pause = %d", w.Code)

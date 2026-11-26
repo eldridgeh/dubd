@@ -49,6 +49,7 @@ Usage:
   dubd set <integer>   tell the running daemon the metric
   dubd status          print the running daemon's state
   dubd pause | play    pause or resume the stream
+  dubd next            move to another stream
   dubd version
 
 Run "dubd run -h" for the daemon's flags.
@@ -71,6 +72,8 @@ func main() {
 		err = client(args, "pause")
 	case "play":
 		err = client(args, "play")
+	case "next":
+		err = client(args, "next")
 	case "version", "--version":
 		fmt.Println("dubd", buildVersion())
 	case "help", "-h", "--help":

@@ -39,10 +39,12 @@ configuration file.
    and opens a new tab if the old one was closed.
 4. On exit it pauses playback.
 
+This has been run against cmux 0.65 on macOS 14.
+
 ## Requirements
 
 - macOS with [cmux](https://cmux.com) installed and running
-- Go 1.22 or later to build
+- Go 1.25 or later to build
 
 ## Install
 
@@ -71,7 +73,23 @@ dubd run -metric-file ~/.landings            # dubd reads a file every 30s
 ```
 
 `dubd status` prints the metric, the playback rate and what is playing.
-`dubd pause` and `dubd play` stop and resume the stream.
+`dubd pause` and `dubd play` stop and resume the stream. `dubd next` moves
+to another stream when the current one is not to your taste.
+
+## Adverts and signing in
+
+Signed out, YouTube Music plays adverts between tracks. `dubd` clicks "Skip"
+when YouTube offers it and shows `"ad": true` in `dubd status` while one
+plays, but the real fix is a YouTube Premium account:
+
+- **Sign in once in the tab.** Click "Sign in" in the YouTube Music tab that
+  `dubd` opened. cmux keeps the login, so it survives restarts of `dubd` and
+  of cmux.
+- **Or bring your login over from another browser.** Run `cmux browser import`
+  in a cmux terminal and pick the browser you are already signed in with.
+
+`dubd status` shows `"signed_in": true` once the tab is signed in. `dubd`
+never sees or stores your credentials.
 
 ## Tempo
 
@@ -122,6 +140,7 @@ The API listens on localhost only.
 | `PUT /metric`        | Set the metric; the body is an integer (or `POST`) |
 | `POST /pause`        | Pause the stream                                   |
 | `POST /play`         | Resume the stream                                  |
+| `POST /next`         | Move to another stream                             |
 
 ## Notes
 
@@ -130,9 +149,6 @@ The API listens on localhost only.
   host. To run it from somewhere else, such as launchd, cmux has to be
   started with `CMUX_SOCKET_MODE=allowAll`, which lets any local process
   control it.
-- **YouTube Music account.** Playback works signed out, with ads. Sign in to
-  YouTube Music in the cmux browser tab for a Premium account's ad-free
-  playback.
 - **The tab is remembered.** A restarted daemon takes over the tab it opened
   before instead of opening another.
 
