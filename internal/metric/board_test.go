@@ -139,27 +139,52 @@ func TestAgentNamesAndLimit(t *testing.T) {
 	}
 }
 
+// With many agents reporting at once, the last total handed to OnChange
+// must be the board's total: an older total must never arrive after a
+// newer one.
 func TestThirtyAgentsAtOnce(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		b := NewBoard(0, Sum, 0, time.Hour)
+		last := 0 // written only inside OnChange, which the board serialises
+		b.OnChange = func(total int, _ string) { last = total }
+		var wg sync.WaitGroup
+		for a := 0; a < 30; a++ {
+			wg.Add(1)
+			go func(a int) {
+				defer wg.Done()
+				for i := 0; i <= 20; i++ {
+					b.SetAgent(fmt.Sprintf("agent-%d", a), i%3)
+				}
+			}(a)
+		}
+		wg.Wait()
+		// Every agent's last report was 20 % 3 = 2.
+		if b.Total() != 60 || len(b.Agents()) != 30 {
+			t.Fatalf("total %d agents %d, want 60 and 30", b.Total(), len(b.Agents()))
+		}
+		if last != 60 {
+			t.Fatalf("round %d: the last total reported was %d, but the board holds 60", round, last)
+		}
+	}
+}
+
+func TestManyLandingsDoNotOverflow(t *testing.T) {
 	b := NewBoard(0, Sum, 0, time.Hour)
-	var mu sync.Mutex
-	last := 0
-	b.OnChange = func(total int, _ string) { mu.Lock(); last = total; mu.Unlock() }
-	var wg sync.WaitGroup
-	for a := 0; a < 30; a++ {
-		wg.Add(1)
-		go func(a int) {
-			defer wg.Done()
-			for i := 0; i <= 20; i++ {
-				b.SetAgent(fmt.Sprintf("agent-%d", a), i%3)
-			}
-		}(a)
+	for i := 0; i < 2563; i++ {
+		if _, err := b.Land("", 1000); err != nil {
+			t.Fatal(err)
+		}
 	}
-	wg.Wait()
-	// Every agent's last report was 20 % 3 = 2.
-	if b.Total() != 60 || len(b.Agents()) != 30 {
-		t.Fatalf("total %d agents %d, want 60 and 30", b.Total(), len(b.Agents()))
+	if b.Total() != 2563000 {
+		t.Fatalf("2563 reports of 1000 landings = %d per hour, want 2563000", b.Total())
 	}
-	_ = last
+	short := NewBoard(0, Sum, 0, time.Minute)
+	for i := 0; i < 50000; i++ {
+		short.Land("", 1000)
+	}
+	if got := short.Total(); got != 1<<31-1 {
+		t.Fatalf("an enormous rate = %d, want it capped at %d", got, 1<<31-1)
+	}
 }
 
 func TestLandingsAreCountedPerHour(t *testing.T) {

@@ -3,6 +3,7 @@ package metric
 import (
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"sync"
@@ -65,7 +66,9 @@ type landing struct {
 // force, and switching forgets what the other ways had recorded.
 type Board struct {
 	// OnChange is called with the metric and where it came from after
-	// every report, and when agents expire.
+	// every report, and when agents expire. Calls are made in the order
+	// the changes happened, with the board locked, so OnChange must not
+	// call back into the board.
 	OnChange func(total int, source string)
 
 	combine Combine
@@ -78,7 +81,8 @@ type Board struct {
 	whole    int
 	agents   map[string]Agent
 	landings []landing
-	last     int // the metric as last reported, to notice landings ageing out
+	landed   int64 // landings in the window, kept in step with landings
+	last     int   // the metric as last reported, to notice landings ageing out
 }
 
 // NewBoard returns a board holding the whole number start. Agents that
@@ -95,9 +99,9 @@ func NewBoard(start int, combine Combine, ttl, window time.Duration) *Board {
 // Set sets the whole number and forgets any agents and landings.
 func (b *Board) Set(v int, source string) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.use(ModeTotal)
 	b.whole, b.last = v, v
-	b.mu.Unlock()
 	b.changed(v, source)
 }
 
@@ -107,7 +111,7 @@ func (b *Board) use(mode string) {
 	if b.mode == mode {
 		return
 	}
-	b.mode, b.whole, b.landings = mode, 0, nil
+	b.mode, b.whole, b.landings, b.landed = mode, 0, nil, 0
 	clear(b.agents)
 }
 
@@ -121,16 +125,16 @@ func (b *Board) Land(agent string, n int) (int, error) {
 		return 0, errors.New("the number of landings must be between 1 and 1000")
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.use(ModeLandings)
 	b.prune()
 	if len(b.landings) >= MaxLandings {
-		b.mu.Unlock()
 		return 0, fmt.Errorf("too many landings in the window (limit %d reports)", MaxLandings)
 	}
 	b.landings = append(b.landings, landing{at: b.now(), n: n, agent: agent})
+	b.landed += int64(n)
 	total := b.total()
 	b.last = total
-	b.mu.Unlock()
 	b.changed(total, ModeLandings)
 	return total, nil
 }
@@ -140,6 +144,7 @@ func (b *Board) prune() {
 	cut := b.now().Add(-b.window)
 	i := 0
 	for i < len(b.landings) && !b.landings[i].at.After(cut) {
+		b.landed -= int64(b.landings[i].n)
 		i++
 	}
 	b.landings = b.landings[i:]
@@ -153,15 +158,14 @@ func (b *Board) SetAgent(name string, v int) (int, error) {
 		return 0, errAgentName
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.use(ModeAgents)
 	if _, known := b.agents[name]; !known && len(b.agents) >= MaxAgents {
-		b.mu.Unlock()
 		return 0, fmt.Errorf("too many agents (limit %d)", MaxAgents)
 	}
 	b.agents[name] = Agent{Name: name, Value: v, Updated: b.now()}
 	total := b.total()
 	b.last = total
-	b.mu.Unlock()
 	b.changed(total, ModeAgents)
 	return total, nil
 }
@@ -169,11 +173,11 @@ func (b *Board) SetAgent(name string, v int) (int, error) {
 // Forget drops one agent and reports whether it was known.
 func (b *Board) Forget(name string) bool {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	_, known := b.agents[name]
 	delete(b.agents, name)
 	total := b.total()
 	b.last = total
-	b.mu.Unlock()
 	if known {
 		b.changed(total, ModeAgents)
 	}
@@ -184,6 +188,7 @@ func (b *Board) Forget(name string) bool {
 // window, and reports the metric if that changed it. Call it now and then.
 func (b *Board) Expire() {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.ttl > 0 {
 		for name, a := range b.agents {
 			if b.now().Sub(a.Updated) > b.ttl {
@@ -195,7 +200,6 @@ func (b *Board) Expire() {
 	total, mode := b.total(), b.mode
 	moved := total != b.last
 	b.last = total
-	b.mu.Unlock()
 	if moved {
 		b.changed(total, mode)
 	}
@@ -256,12 +260,12 @@ func (b *Board) total() int {
 		return b.whole
 	case ModeLandings:
 		b.prune()
-		count := 0
-		for _, l := range b.landings {
-			count += l.n
-		}
+		count := b.landed
 		// Per hour, whatever the window, rounded to the nearest whole.
-		return int((int64(count)*int64(time.Hour) + int64(b.window)/2) / int64(b.window))
+		// Worked in floating point: the count times an hour in
+		// nanoseconds does not fit in an integer for large counts.
+		perHour := math.Round(float64(count) * float64(time.Hour) / float64(b.window))
+		return int(math.Min(perHour, math.MaxInt32))
 	}
 	if len(b.agents) == 0 {
 		return 0
