@@ -101,8 +101,8 @@ func (b *Board) Set(v int, source string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.use(ModeTotal)
-	b.whole, b.last = v, v
-	b.changed(v, source)
+	b.whole = v
+	b.report(source, true)
 }
 
 // use switches to mode, forgetting what the other ways recorded. Caller
@@ -133,10 +133,7 @@ func (b *Board) Land(agent string, n int) (int, error) {
 	}
 	b.landings = append(b.landings, landing{at: b.now(), n: n, agent: agent})
 	b.landed += int64(n)
-	total := b.total()
-	b.last = total
-	b.changed(total, ModeLandings)
-	return total, nil
+	return b.report(ModeLandings, true), nil
 }
 
 // prune drops landings that have left the window. Caller holds mu.
@@ -164,24 +161,19 @@ func (b *Board) SetAgent(name string, v int) (int, error) {
 		return 0, fmt.Errorf("too many agents (limit %d)", MaxAgents)
 	}
 	b.agents[name] = Agent{Name: name, Value: v, Updated: b.now()}
-	total := b.total()
-	b.last = total
-	b.changed(total, ModeAgents)
-	return total, nil
+	return b.report(ModeAgents, true), nil
 }
 
 // Forget drops one agent and reports whether it was known.
 func (b *Board) Forget(name string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	_, known := b.agents[name]
-	delete(b.agents, name)
-	total := b.total()
-	b.last = total
-	if known {
-		b.changed(total, ModeAgents)
+	if _, known := b.agents[name]; !known {
+		return false
 	}
-	return known
+	delete(b.agents, name)
+	b.report(ModeAgents, true)
+	return true
 }
 
 // Expire drops agents that have gone quiet and landings that have left the
@@ -196,13 +188,19 @@ func (b *Board) Expire() {
 			}
 		}
 	}
-	b.prune()
-	total, mode := b.total(), b.mode
-	moved := total != b.last
-	b.last = total
-	if moved {
-		b.changed(total, mode)
+	b.report(b.mode, false)
+}
+
+// report works out the metric and passes it to OnChange: always after a
+// report from outside, and otherwise only if it moved. The value last
+// passed on changes nowhere else, so a move is never lost. Caller holds mu.
+func (b *Board) report(source string, always bool) int {
+	total := b.total()
+	if always || total != b.last {
+		b.last = total
+		b.changed(total, source)
 	}
+	return total
 }
 
 // Total returns the metric.

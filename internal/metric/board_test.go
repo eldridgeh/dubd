@@ -263,3 +263,21 @@ func TestLandRefusesBadInput(t *testing.T) {
 		t.Fatalf("refused input changed the board: %d in %s", b.Total(), b.Mode())
 	}
 }
+
+// A landing that ages out must reach OnChange even if something else looks
+// at the board first.
+func TestAgedOutLandingIsReportedAfterOtherCalls(t *testing.T) {
+	b, got, now := newBoard(0, Sum, 0)
+	b.Land("a", 60)
+	*now = now.Add(61 * time.Minute)
+	if b.Forget("nobody") {
+		t.Fatal("Forget reported an unknown agent as known")
+	}
+	if b.Total() != 0 || len(b.Agents()) != 0 {
+		t.Fatalf("the board holds %d", b.Total())
+	}
+	b.Expire()
+	if last := (*got)[len(*got)-1]; last != (change{0, ModeLandings}) {
+		t.Fatalf("the player was last told %v, but the board holds 0", last)
+	}
+}
