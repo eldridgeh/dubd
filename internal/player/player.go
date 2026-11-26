@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -33,8 +34,6 @@ type Config struct {
 
 	Curve     tempo.Curve
 	KeepPitch bool
-	// Glide is the largest change in playback rate per second.
-	Glide float64
 	// Tick is how often the page is checked and corrected.
 	Tick time.Duration
 	// StallAfter restarts the stream when playback has not advanced this long.
@@ -82,6 +81,8 @@ type Status struct {
 	Rate          float64   `json:"rate"`
 	Phase         string    `json:"phase"`
 	Paused        bool      `json:"paused"`
+	Ad            bool      `json:"ad"`
+	SignedIn      bool      `json:"signed_in"`
 	Surface       string    `json:"surface,omitempty"`
 	Page          string    `json:"page,omitempty"`
 	Title         string    `json:"title,omitempty"`
@@ -103,6 +104,7 @@ type Player struct {
 	metricSource string
 	metricAt     time.Time
 	paused       bool
+	next         bool
 
 	status Status // published by the loop after every step
 
@@ -115,10 +117,12 @@ type Player struct {
 	lastOpen     time.Time
 	rate         float64
 	pick         int
+	seed         string // track whose radio is playing
 	fails        int
 	lastPos      float64
 	lastProgress time.Time
 	page         page
+	playing      string // title last logged
 	lastErr      string
 }
 
@@ -149,6 +153,14 @@ func (p *Player) SetPaused(paused bool) {
 	p.paused = paused
 }
 
+// Next drops the current stream and starts the radio of the next search
+// result (or reloads the URL, when one was given).
+func (p *Player) Next() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.next = true
+}
+
 // target is the rate the current metric calls for. Caller holds mu.
 func (p *Player) target() (rate float64, stale bool) {
 	stale = p.cfg.StaleAfter > 0 && p.now().Sub(p.metricAt) > p.cfg.StaleAfter
@@ -174,8 +186,9 @@ func (p *Player) publish() {
 	s := Status{Rate: p.rate, Phase: p.phase, Surface: p.surface, Error: p.lastErr}
 	if p.phase == phasePlaying {
 		s.Page = p.page.Host + p.page.Path
-		s.Title, s.Artist = p.page.Title, p.page.Artist
-		s.Position, s.Duration = p.page.Time, p.page.Duration
+		s.Title, s.Artist, s.Ad = p.page.Title, p.page.Artist, p.page.Ad
+		s.SignedIn = p.page.SignedIn
+		s.Position, s.Duration = math.Round(p.page.Time), math.Round(p.page.Duration)
 	}
 	p.mu.Lock()
 	p.status = s
@@ -222,8 +235,10 @@ func (p *Player) startURL() string {
 
 // radioURL is the endless "radio" queue YouTube Music builds from one track.
 func radioURL(id string) string {
-	return "https://music.youtube.com/watch?v=" + id + "&list=RDAMVM" + id
+	return "https://music.youtube.com/watch?v=" + id + "&list=" + radioPrefix + id
 }
+
+const radioPrefix = "RDAMVM"
 
 func (p *Player) setPhase(phase string) {
 	p.phase, p.phaseSince = phase, p.now()
@@ -239,6 +254,8 @@ func (p *Player) Step(ctx context.Context) {
 	p.mu.Lock()
 	target, _ := p.target()
 	paused := p.paused
+	next := p.next
+	p.next = false
 	p.mu.Unlock()
 	if p.pausedNow && !paused {
 		p.lastProgress = p.now() // resuming is not a stall
@@ -246,11 +263,9 @@ func (p *Player) Step(ctx context.Context) {
 	p.pausedNow = paused
 	defer p.publish()
 
-	if p.rate == 0 {
-		p.rate = target
-	} else {
-		p.rate = tempo.Step(p.rate, target, p.cfg.Glide*p.cfg.Tick.Seconds())
-	}
+	// One rate change per metric change: every change costs an audible
+	// hiccup in WebKit, so the rate is not ramped.
+	p.rate = target
 
 	var err error
 	switch p.phase {
@@ -259,7 +274,12 @@ func (p *Player) Step(ctx context.Context) {
 	case phaseSearching:
 		err = p.search(ctx)
 	case phasePlaying:
-		err = p.play(ctx)
+		if next {
+			p.log.Info("moving to the next stream")
+			err = p.restart(ctx)
+		} else {
+			err = p.play(ctx)
+		}
 	}
 	p.note(err)
 }
@@ -307,6 +327,7 @@ func (p *Player) adopt(ctx context.Context) bool {
 		return false
 	}
 	p.surface = surface
+	p.seed = strings.TrimPrefix(pg.List, radioPrefix)
 	p.setPhase(phasePlaying)
 	// Give it a few seconds to show it is playing before starting over.
 	p.lastProgress = p.now().Add(5*time.Second - p.cfg.StallAfter)
@@ -339,9 +360,16 @@ func (p *Player) search(ctx context.Context) error {
 		}
 		return nil
 	}
-	// Each restart moves on to the next of the top results.
-	id := f.IDs[p.pick%min(len(f.IDs), 5)]
+	// Each restart moves on to the next of the top results, and never
+	// straight back to the stream that was just playing.
+	top := f.IDs[:min(len(f.IDs), 5)]
+	id := top[p.pick%len(top)]
+	if id == p.seed && len(top) > 1 {
+		p.pick++
+		id = top[p.pick%len(top)]
+	}
 	p.pick++
+	p.seed = id
 	if err := p.b.Goto(ctx, p.surface, radioURL(id)); err != nil {
 		return err
 	}
@@ -356,7 +384,11 @@ func (p *Player) play(ctx context.Context) error {
 	if err := p.b.Eval(ctx, p.surface, tickScript(w), &pg); err != nil {
 		return err
 	}
-	if pg.Title != p.page.Title && pg.Video && pg.Title != "" {
+	switch {
+	case pg.Ad && !p.page.Ad:
+		p.log.Info("advert playing")
+	case !pg.Ad && pg.Video && pg.Title != "" && pg.Title != p.playing:
+		p.playing = pg.Title
 		p.log.Info("now playing", "title", pg.Title, "artist", pg.Artist, "rate", p.rate)
 	}
 	p.page = pg
@@ -367,6 +399,11 @@ func (p *Player) play(ctx context.Context) error {
 		return nil
 	}
 	p.log.Warn("playback stalled; restarting stream", "page", pg.Host+pg.Path)
+	return p.restart(ctx)
+}
+
+// restart loads a fresh stream in the same surface.
+func (p *Player) restart(ctx context.Context) error {
 	if p.cfg.URL != "" {
 		p.setPhase(phasePlaying)
 		return p.b.Goto(ctx, p.surface, p.cfg.URL)

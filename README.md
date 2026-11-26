@@ -1,27 +1,50 @@
 # dubd
 
+[![CI](https://github.com/eldridgeh/dubd/actions/workflows/ci.yml/badge.svg)](https://github.com/eldridgeh/dubd/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/eldridgeh/dubd.svg)](https://pkg.go.dev/github.com/eldridgeh/dubd)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A small Go daemon that plays a continuous stream of dub in a
 [cmux](https://cmux.com) browser tab and scales its tempo to an integer you
 give it, such as code merges landed per hour. A slow drag means not much is
 landing. A quick skank means the queue is moving. Silence means the daemon
 has stopped.
 
+## Quick start
+
+In a terminal tab inside cmux:
+
+```sh
+go install github.com/eldridgeh/dubd@latest
+dubd run -metric-cmd 'your-command-that-prints-landings-per-hour'
+```
+
+A browser tab opens beside your terminal and the dub starts within about 15
+seconds. `dubd` runs the command every 30 seconds and the tempo follows the
+number it prints. No command to hand? Run `dubd run` and push the number in
+with `dubd set 7` or an HTTP `PUT` (see [Run](#run)).
+
+One binary, no dependencies outside the Go standard library, no
+configuration file.
+
 ## How it works
 
 1. `dubd run` opens a browser tab in cmux (without taking focus), searches
    YouTube Music, and starts the "radio" of a top result, which is an endless
    queue.
-2. Once a second it sets the playback rate of the page's media element to
-   match the metric, gliding to a new rate instead of jumping.
+2. Once a second it checks the page's media element and holds its playback
+   rate to the one the metric calls for.
 3. It keeps the stream alive: it resumes playback if paused, answers the
    "still listening?" prompt, restarts with another track if playback stalls,
    and opens a new tab if the old one was closed.
 4. On exit it pauses playback.
 
+This has been run against cmux 0.65 on macOS 14.
+
 ## Requirements
 
 - macOS with [cmux](https://cmux.com) installed and running
-- Go 1.22 or later to build
+- Go 1.25 or later to build
 
 ## Install
 
@@ -50,7 +73,26 @@ dubd run -metric-file ~/.landings            # dubd reads a file every 30s
 ```
 
 `dubd status` prints the metric, the playback rate and what is playing.
-`dubd pause` and `dubd play` stop and resume the stream.
+`dubd pause` and `dubd play` stop and resume the stream. `dubd next` moves
+to another stream when the current one is not to your taste.
+
+## Adverts and signing in
+
+Signed out, YouTube Music plays adverts between tracks. `dubd` clicks "Skip"
+when YouTube offers it and shows `"ad": true` in `dubd status` while one
+plays, but the real fix is a YouTube Premium account:
+
+- **Sign in once in the tab.** Click "Sign in" in the YouTube Music tab that
+  `dubd` opened. cmux keeps the login, so it survives restarts of `dubd` and
+  of cmux.
+- **Or bring your login over from another browser.** In a cmux terminal, run
+  `cmux browser import --from chrome` (or `firefox`, `arc` and so on), or
+  `cmux browser import --interactive` to pick from the browsers cmux finds.
+  Add `--domain youtube.com` to bring over only YouTube's cookies. Safari is
+  not supported by cmux's importer.
+
+`dubd status` shows `"signed_in": true` once the tab is signed in. `dubd`
+never sees or stores your credentials.
 
 ## Tempo
 
@@ -65,6 +107,11 @@ The defaults:
 
 Change the range with `-metric-min`, `-metric-max`, `-rate-min` and
 `-rate-max`. Rates from 0.25x to 4x are accepted.
+
+The rate changes once per change of the metric, with a half-second dip in
+volume around it. The browser engine cmux uses (WebKit) drops the audio for a
+moment whenever the playback rate changes; the dip puts that drop in silence,
+so a tempo change sounds like a short swell and not a skip.
 
 Pitch is held steady by default, so only the tempo moves. With `-tape` the
 pitch follows the tempo, like slowing down a tape machine, which makes the
@@ -82,7 +129,6 @@ difference easier to hear from across the room.
 | `-rate-min`    | `0.6`            | Slowest playback rate                                                |
 | `-rate-max`    | `1.6`            | Fastest playback rate                                                |
 | `-tape`        | off              | Let pitch follow tempo                                               |
-| `-glide`       | `0.05`           | Largest playback-rate change per second; `0` jumps                   |
 | `-metric-cmd`  |                  | Shell command that prints the metric                                 |
 | `-metric-file` |                  | File that holds the metric                                           |
 | `-interval`    | `30s`            | How often the command or file is read                                |
@@ -101,6 +147,7 @@ The API listens on localhost only.
 | `PUT /metric`        | Set the metric; the body is an integer (or `POST`) |
 | `POST /pause`        | Pause the stream                                   |
 | `POST /play`         | Resume the stream                                  |
+| `POST /next`         | Move to another stream                             |
 
 ## Notes
 
@@ -109,9 +156,6 @@ The API listens on localhost only.
   host. To run it from somewhere else, such as launchd, cmux has to be
   started with `CMUX_SOCKET_MODE=allowAll`, which lets any local process
   control it.
-- **YouTube Music account.** Playback works signed out, with ads. Sign in to
-  YouTube Music in the cmux browser tab for a Premium account's ad-free
-  playback.
 - **The tab is remembered.** A restarted daemon takes over the tab it opened
   before instead of opening another.
 

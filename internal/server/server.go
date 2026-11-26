@@ -15,6 +15,7 @@ import (
 type Player interface {
 	SetMetric(v int, source string)
 	SetPaused(paused bool)
+	Next()
 	Status() player.Status
 }
 
@@ -30,12 +31,14 @@ type Info struct {
 //	GET  /metric          the metric as plain text
 //	PUT  /metric          set the metric; the body is an integer (POST also works)
 //	POST /pause, /play    pause or resume the stream
+//	POST /next            move to another stream
 func New(p Player, version string) http.Handler {
 	mux := http.NewServeMux()
 	status := func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
+		enc.SetEscapeHTML(false)
 		_ = enc.Encode(Info{Version: version, Status: p.Status()})
 	}
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) { status(w) })
@@ -60,6 +63,7 @@ func New(p Player, version string) http.Handler {
 	mux.HandleFunc("POST /metric", setMetric)
 	mux.HandleFunc("POST /pause", func(w http.ResponseWriter, _ *http.Request) { p.SetPaused(true); status(w) })
 	mux.HandleFunc("POST /play", func(w http.ResponseWriter, _ *http.Request) { p.SetPaused(false); status(w) })
+	mux.HandleFunc("POST /next", func(w http.ResponseWriter, _ *http.Request) { p.Next(); status(w) })
 	return localOnly(mux)
 }
 

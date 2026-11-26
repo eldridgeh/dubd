@@ -23,6 +23,7 @@ type fakeBrowser struct {
 	url    string
 	ids    []string // tracks the search page shows
 	stuck  bool     // playback does not advance
+	ad     bool     // an advert is showing
 	gone   bool     // the surface no longer exists
 	err    error    // every call fails with this
 	pos    float64
@@ -68,8 +69,12 @@ func (f *fakeBrowser) Eval(_ context.Context, _ string, script string, out any) 
 		if watching && f.last.Play && !f.stuck {
 			f.pos += f.last.Rate
 		}
-		res = page{Host: "music.youtube.com", Path: "/watch", Video: watching, Loaded: watching,
-			Paused: !f.last.Play, Rate: f.last.Rate, Time: f.pos, Title: "Track"}
+		list := ""
+		if i := strings.Index(f.url, "list="); i >= 0 {
+			list = f.url[i+len("list="):]
+		}
+		res = page{Host: "music.youtube.com", Path: "/watch", List: list, Video: watching, Loaded: watching,
+			Paused: !f.last.Play, Rate: f.last.Rate, Time: f.pos, Title: "Track", Ad: f.ad}
 	} else {
 		ids := f.ids
 		if !strings.Contains(f.url, "/search") {
@@ -132,9 +137,9 @@ func TestDirectURL(t *testing.T) {
 	}
 }
 
-func TestRateGlidesToMetric(t *testing.T) {
+func TestRateFollowsMetricInOneChange(t *testing.T) {
 	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
-	p, c := newTest(t, Config{Query: "q", Glide: 0.1}, f, 0)
+	p, c := newTest(t, Config{Query: "q"}, f, 0)
 	steps(p, c, 3)
 	if f.last.Rate != 0.5 {
 		t.Fatalf("starting rate = %v", f.last.Rate)
@@ -143,13 +148,24 @@ func TestRateGlidesToMetric(t *testing.T) {
 	if got := p.Status().TargetRate; got != 1.5 {
 		t.Fatalf("target = %v", got)
 	}
-	steps(p, c, 3)
-	if f.last.Rate != 0.8 {
-		t.Fatalf("rate after 3s = %v, want 0.8", f.last.Rate)
-	}
-	steps(p, c, 20)
+	steps(p, c, 1)
 	if f.last.Rate != 1.5 || p.Status().Rate != 1.5 {
-		t.Fatalf("settled rate = %v", f.last.Rate)
+		t.Fatalf("rate one step after the change = %v, want 1.5", f.last.Rate)
+	}
+}
+
+func TestNextAfterReusingATabMovesOn(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "surface")
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
+	p, c := newTest(t, Config{Query: "q", SurfaceFile: file}, f, 5)
+	steps(p, c, 4)
+
+	p2, c2 := newTest(t, Config{Query: "q", SurfaceFile: file}, f, 5)
+	steps(p2, c2, 2)
+	p2.Next()
+	steps(p2, c2, 3)
+	if got := f.gotos[len(f.gotos)-1]; got != radioURL("bbbbbbbbbbb") {
+		t.Fatalf("next after reuse went to %q", got)
 	}
 }
 
@@ -178,6 +194,32 @@ func TestStallRestartsWithNextTrack(t *testing.T) {
 	}
 	if len(f.opened) != 1 {
 		t.Fatalf("opened %d surfaces, want 1", len(f.opened))
+	}
+}
+
+func TestNextStartsAnotherStream(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
+	p, c := newTest(t, Config{Query: "q"}, f, 5)
+	steps(p, c, 4)
+	p.Next()
+	steps(p, c, 3)
+	want := []string{radioURL("aaaaaaaaaaa"), "https://music.youtube.com/search?q=q", radioURL("bbbbbbbbbbb")}
+	if strings.Join(f.gotos, " ") != strings.Join(want, " ") || p.Status().Phase != phasePlaying {
+		t.Fatalf("gotos = %q", f.gotos)
+	}
+}
+
+func TestAdvertIsReported(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}, ad: true}
+	p, c := newTest(t, Config{Query: "q"}, f, 5)
+	steps(p, c, 4)
+	if !p.Status().Ad {
+		t.Fatal("advert not reported")
+	}
+	f.ad = false
+	steps(p, c, 1)
+	if p.Status().Ad {
+		t.Fatal("advert still reported")
 	}
 }
 
