@@ -44,16 +44,4 @@ func (c Curve) Rate(metric int) float64 {
 	return round3(c.RateMin + frac*(c.RateMax-c.RateMin))
 }
 
-// Step moves current toward target by at most maxStep. A maxStep of zero or
-// less jumps straight to the target.
-func Step(current, target, maxStep float64) float64 {
-	if maxStep <= 0 || math.Abs(target-current) <= maxStep {
-		return target
-	}
-	if target > current {
-		return round3(current + maxStep)
-	}
-	return round3(current - maxStep)
-}
-
 func round3(f float64) float64 { return math.Round(f*1000) / 1000 }

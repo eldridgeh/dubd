@@ -103,7 +103,6 @@ func run(args []string) error {
 		rateMin    = fs.Float64("rate-min", 0.6, "slowest playback rate")
 		rateMax    = fs.Float64("rate-max", 1.6, "fastest playback rate")
 		tape       = fs.Bool("tape", false, "let pitch follow tempo, like a tape machine, instead of holding pitch")
-		glide      = fs.Float64("glide", 0.05, "largest playback-rate change per second (0 jumps)")
 		metricCmd  = fs.String("metric-cmd", "", "shell command that prints the metric; run every -interval")
 		metricFile = fs.String("metric-file", "", "file that holds the metric; read every -interval")
 		interval   = fs.Duration("interval", 30*time.Second, "how often -metric-cmd or -metric-file is read")
@@ -125,8 +124,6 @@ func run(args []string) error {
 		return errors.New("use -metric-cmd or -metric-file, not both")
 	case *interval < time.Second:
 		return errors.New("-interval must be at least 1s")
-	case *glide < 0:
-		return errors.New("-glide must not be negative")
 	case *streamURL == "" && strings.TrimSpace(*query) == "":
 		return errors.New("-query must not be empty")
 	}
@@ -146,7 +143,7 @@ func run(args []string) error {
 
 	cfg := player.Config{
 		URL: *streamURL, Query: *query, Curve: curve, KeepPitch: !*tape,
-		Glide: *glide, StaleAfter: *staleAfter, SurfaceFile: surfaceFile(),
+		StaleAfter: *staleAfter, SurfaceFile: surfaceFile(),
 	}
 	p := player.New(cfg, browser, log, *start)
 

@@ -30,16 +30,3 @@ func TestValidate(t *testing.T) {
 		}
 	}
 }
-
-func TestStep(t *testing.T) {
-	for _, tc := range []struct{ cur, target, max, want float64 }{
-		{1.0, 1.5, 0.05, 1.05},
-		{1.0, 0.5, 0.05, 0.95},
-		{1.0, 1.02, 0.05, 1.02},
-		{1.0, 1.5, 0, 1.5},
-	} {
-		if got := Step(tc.cur, tc.target, tc.max); got != tc.want {
-			t.Errorf("Step(%v,%v,%v) = %v, want %v", tc.cur, tc.target, tc.max, got, tc.want)
-		}
-	}
-}

@@ -34,8 +34,6 @@ type Config struct {
 
 	Curve     tempo.Curve
 	KeepPitch bool
-	// Glide is the largest change in playback rate per second.
-	Glide float64
 	// Tick is how often the page is checked and corrected.
 	Tick time.Duration
 	// StallAfter restarts the stream when playback has not advanced this long.
@@ -119,6 +117,7 @@ type Player struct {
 	lastOpen     time.Time
 	rate         float64
 	pick         int
+	seed         string // track whose radio is playing
 	fails        int
 	lastPos      float64
 	lastProgress time.Time
@@ -236,8 +235,10 @@ func (p *Player) startURL() string {
 
 // radioURL is the endless "radio" queue YouTube Music builds from one track.
 func radioURL(id string) string {
-	return "https://music.youtube.com/watch?v=" + id + "&list=RDAMVM" + id
+	return "https://music.youtube.com/watch?v=" + id + "&list=" + radioPrefix + id
 }
+
+const radioPrefix = "RDAMVM"
 
 func (p *Player) setPhase(phase string) {
 	p.phase, p.phaseSince = phase, p.now()
@@ -262,11 +263,9 @@ func (p *Player) Step(ctx context.Context) {
 	p.pausedNow = paused
 	defer p.publish()
 
-	if p.rate == 0 {
-		p.rate = target
-	} else {
-		p.rate = tempo.Step(p.rate, target, p.cfg.Glide*p.cfg.Tick.Seconds())
-	}
+	// One rate change per metric change: every change costs an audible
+	// hiccup in WebKit, so the rate is not ramped.
+	p.rate = target
 
 	var err error
 	switch p.phase {
@@ -328,6 +327,7 @@ func (p *Player) adopt(ctx context.Context) bool {
 		return false
 	}
 	p.surface = surface
+	p.seed = strings.TrimPrefix(pg.List, radioPrefix)
 	p.setPhase(phasePlaying)
 	// Give it a few seconds to show it is playing before starting over.
 	p.lastProgress = p.now().Add(5*time.Second - p.cfg.StallAfter)
@@ -360,9 +360,16 @@ func (p *Player) search(ctx context.Context) error {
 		}
 		return nil
 	}
-	// Each restart moves on to the next of the top results.
-	id := f.IDs[p.pick%min(len(f.IDs), 5)]
+	// Each restart moves on to the next of the top results, and never
+	// straight back to the stream that was just playing.
+	top := f.IDs[:min(len(f.IDs), 5)]
+	id := top[p.pick%len(top)]
+	if id == p.seed && len(top) > 1 {
+		p.pick++
+		id = top[p.pick%len(top)]
+	}
 	p.pick++
+	p.seed = id
 	if err := p.b.Goto(ctx, p.surface, radioURL(id)); err != nil {
 		return err
 	}

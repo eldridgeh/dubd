@@ -32,8 +32,8 @@ configuration file.
 1. `dubd run` opens a browser tab in cmux (without taking focus), searches
    YouTube Music, and starts the "radio" of a top result, which is an endless
    queue.
-2. Once a second it sets the playback rate of the page's media element to
-   match the metric, gliding to a new rate instead of jumping.
+2. Once a second it checks the page's media element and holds its playback
+   rate to the one the metric calls for.
 3. It keeps the stream alive: it resumes playback if paused, answers the
    "still listening?" prompt, restarts with another track if playback stalls,
    and opens a new tab if the old one was closed.
@@ -85,8 +85,11 @@ plays, but the real fix is a YouTube Premium account:
 - **Sign in once in the tab.** Click "Sign in" in the YouTube Music tab that
   `dubd` opened. cmux keeps the login, so it survives restarts of `dubd` and
   of cmux.
-- **Or bring your login over from another browser.** Run `cmux browser import`
-  in a cmux terminal and pick the browser you are already signed in with.
+- **Or bring your login over from another browser.** In a cmux terminal, run
+  `cmux browser import --from chrome` (or `firefox`, `arc` and so on), or
+  `cmux browser import --interactive` to pick from the browsers cmux finds.
+  Add `--domain youtube.com` to bring over only YouTube's cookies. Safari is
+  not supported by cmux's importer.
 
 `dubd status` shows `"signed_in": true` once the tab is signed in. `dubd`
 never sees or stores your credentials.
@@ -105,6 +108,11 @@ The defaults:
 Change the range with `-metric-min`, `-metric-max`, `-rate-min` and
 `-rate-max`. Rates from 0.25x to 4x are accepted.
 
+The rate changes once per change of the metric, with a half-second dip in
+volume around it. The browser engine cmux uses (WebKit) drops the audio for a
+moment whenever the playback rate changes; the dip puts that drop in silence,
+so a tempo change sounds like a short swell and not a skip.
+
 Pitch is held steady by default, so only the tempo moves. With `-tape` the
 pitch follows the tempo, like slowing down a tape machine, which makes the
 difference easier to hear from across the room.
@@ -121,7 +129,6 @@ difference easier to hear from across the room.
 | `-rate-min`    | `0.6`            | Slowest playback rate                                                |
 | `-rate-max`    | `1.6`            | Fastest playback rate                                                |
 | `-tape`        | off              | Let pitch follow tempo                                               |
-| `-glide`       | `0.05`           | Largest playback-rate change per second; `0` jumps                   |
 | `-metric-cmd`  |                  | Shell command that prints the metric                                 |
 | `-metric-file` |                  | File that holds the metric                                           |
 | `-interval`    | `30s`            | How often the command or file is read                                |

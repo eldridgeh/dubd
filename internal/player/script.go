@@ -21,6 +21,7 @@ type want struct {
 type page struct {
 	Host     string  `json:"host"`
 	Path     string  `json:"path"`
+	List     string  `json:"list"`
 	Video    bool    `json:"video"`
 	Ad       bool    `json:"ad"`
 	SignedIn bool    `json:"signedIn"`
@@ -41,6 +42,7 @@ type found struct {
 const tickJS = `(() => {
   const want = %s;
   const out = {host: location.hostname, path: location.pathname, video: false};
+  out.list = new URLSearchParams(location.search).get('list') || '';
   const text = (sel) => { const el = document.querySelector(sel); return el ? el.textContent.trim().replace(/\s+/g, ' ') : ''; };
   for (const b of document.querySelectorAll('ytmusic-you-there-renderer button, yt-confirm-dialog-renderer #confirm-button button')) {
     if (b.offsetParent !== null) b.click();
@@ -57,7 +59,32 @@ const tickJS = `(() => {
     out.video = true;
     out.loaded = !!(v.currentSrc || v.src);
     for (const k of ['preservesPitch', 'webkitPreservesPitch']) { if (k in v) v[k] = want.keepPitch; }
-    if (Math.abs(v.playbackRate - want.rate) > 0.0005) v.playbackRate = want.rate;
+    if (Math.abs(v.playbackRate - want.rate) > 0.0005) {
+      // WebKit drops the audio for a moment whenever the rate changes. Dip
+      // the volume around the change so the drop lands in silence and is
+      // heard as a short swell, not a gap. The dip state lives on the
+      // element so that an overlapping call leaves it alone.
+      if (v.paused || v.muted || v.volume === 0) {
+        v.playbackRate = want.rate;
+      } else if (!v.dataset.dubdDip) {
+        const full = v.volume;
+        // Timed by the clock, so a throttled timer shortens the ramp
+        // instead of stretching it.
+        const ramp = (from, to, ms, done) => {
+          const start = performance.now();
+          const id = setInterval(() => {
+            const k = Math.min(1, (performance.now() - start) / ms);
+            v.volume = Math.max(0, Math.min(1, from + (to - from) * k));
+            if (k >= 1) { clearInterval(id); done(); }
+          }, 15);
+        };
+        v.dataset.dubdDip = '1';
+        ramp(full, 0, 120, () => {
+          v.playbackRate = want.rate;
+          setTimeout(() => ramp(0, full, 250, () => { delete v.dataset.dubdDip; }), 180);
+        });
+      }
+    }
     if (want.play && v.paused && out.loaded) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
     if (!want.play && !v.paused) v.pause();
     out.paused = v.paused;
