@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -27,6 +28,17 @@ import (
 )
 
 const defaultAddr = "127.0.0.1:8382"
+
+// addrDefault is the address used when -addr is not given: $DUBD_ADDR if
+// set, so that a shell or an agent can be pointed at its own instance.
+func addrDefault() string {
+	if a := os.Getenv("DUBD_ADDR"); a != "" {
+		return a
+	}
+	return defaultAddr
+}
+
+var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // version is set at release time with -ldflags "-X main.version=...".
 var version = ""
@@ -98,7 +110,8 @@ func main() {
 func run(args []string) error {
 	fs := flag.NewFlagSet("dubd run", flag.ContinueOnError)
 	var (
-		addr       = fs.String("addr", defaultAddr, "address the local HTTP API listens on")
+		addr       = fs.String("addr", addrDefault(), "address the local HTTP API listens on; $DUBD_ADDR sets the default")
+		name       = fs.String("name", "", "name of this instance, when running several; each keeps its own browser tab")
 		query      = fs.String("query", "ai dub reggae", "YouTube Music search; the stream is the radio of a top result")
 		streamURL  = fs.String("url", "", "play this YouTube Music link (a playlist, album or track) instead of searching")
 		start      = fs.Int("metric", 0, "metric value to start with")
@@ -126,6 +139,8 @@ func run(args []string) error {
 	switch {
 	case *metricCmd != "" && *metricFile != "":
 		return errors.New("use -metric-cmd or -metric-file, not both")
+	case *name != "" && !nameRE.MatchString(*name):
+		return errors.New("-name may use letters, digits, dot, dash and underscore, up to 64 characters")
 	case *interval < time.Second:
 		return errors.New("-interval must be at least 1s")
 	}
@@ -157,14 +172,14 @@ func run(args []string) error {
 
 	cfg := player.Config{
 		Stream: stream, Curve: curve, KeepPitch: !*tape,
-		StaleAfter: *staleAfter, SurfaceFile: surfaceFile(),
+		StaleAfter: *staleAfter, SurfaceFile: surfaceFile(*name),
 	}
 	p := player.New(cfg, browser, log, *start)
 	browser.OnDialog = p.NoteDialog
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
-		return fmt.Errorf("%w (is dubd already running?)", err)
+		return fmt.Errorf("%w (is dubd already running? a second instance needs its own -addr and -name)", err)
 	}
 	srv := &http.Server{Handler: server.New(p, buildVersion()), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
@@ -172,21 +187,21 @@ func run(args []string) error {
 			log.Error("http", "error", err)
 		}
 	}()
-	log.Info("dubd running", "version", buildVersion(), "api", "http://"+ln.Addr().String(),
+	log.Info("dubd running", "version", buildVersion(), "name", *name, "api", "http://"+ln.Addr().String(),
 		"metric", *start, "rate", curve.Rate(*start))
 
 	var src metric.Source
-	name := ""
+	source := ""
 	switch {
 	case *metricCmd != "":
-		src, name = metric.Command(*metricCmd), "cmd"
+		src, source = metric.Command(*metricCmd), "cmd"
 	case *metricFile != "":
-		src, name = metric.File(*metricFile), "file"
+		src, source = metric.File(*metricFile), "file"
 	}
 	if src != nil {
 		go metric.Poll(ctx, src, *interval,
-			func(v int) { p.SetMetric(v, name) },
-			func(err error) { log.Error("reading metric", "source", name, "error", err) })
+			func(v int) { p.SetMetric(v, source) },
+			func(err error) { log.Error("reading metric", "source", source, "error", err) })
 	}
 
 	p.Run(ctx) // returns once ctx ends and playback is paused
@@ -197,19 +212,23 @@ func run(args []string) error {
 	return nil
 }
 
-// surfaceFile is where the daemon remembers its browser tab between runs.
-func surfaceFile() string {
+// surfaceFile is where an instance remembers its browser tab between runs.
+// Each named instance has its own, so several can run side by side.
+func surfaceFile(name string) string {
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(dir, "dubd", "surface")
+	if name == "" {
+		return filepath.Join(dir, "dubd", "surface")
+	}
+	return filepath.Join(dir, "dubd", "surface."+name)
 }
 
 // client sends one request to the running daemon and prints the answer.
 func client(args []string, cmd string) error {
 	fs := flag.NewFlagSet("dubd "+cmd, flag.ContinueOnError)
-	addr := fs.String("addr", defaultAddr, "address of the running daemon")
+	addr := fs.String("addr", addrDefault(), "address of the running daemon; $DUBD_ADDR sets the default")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

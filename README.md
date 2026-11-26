@@ -93,6 +93,28 @@ A link can be a playlist, an album or a single track on YouTube Music or
 YouTube. A playlist that ends starts again from the top. A private playlist
 needs the tab signed in to the account that owns it.
 
+## Several instances
+
+To give each agent, team or project its own music, run one instance each.
+Give every instance its own name and port; a name keeps that instance's
+browser tab separate from the others'.
+
+```sh
+dubd run -name alpha -addr 127.0.0.1:8401 -query 'ai dub reggae'
+dubd run -name beta  -addr 127.0.0.1:8402 -query 'heavy dub techno'
+```
+
+Point each sender at its own instance with `-addr`, or once with the
+`DUBD_ADDR` environment variable:
+
+```sh
+dubd set 7 -addr 127.0.0.1:8401
+DUBD_ADDR=127.0.0.1:8402 dubd set 3
+```
+
+Each instance is one playing tab, so instances on the same machine are all
+heard at once.
+
 ## Adverts and signing in
 
 Signed out, YouTube Music plays adverts between tracks. `dubd` clicks "Skip"
@@ -150,7 +172,8 @@ difference easier to hear from across the room.
 | `-metric-file` |                  | File that holds the metric                                           |
 | `-interval`    | `30s`            | How often the command or file is read                                |
 | `-stale-after` | `0` (never)      | Drop to `-rate-min` when the metric has not been updated this long   |
-| `-addr`        | `127.0.0.1:8382` | Address the HTTP API listens on                                      |
+| `-addr`        | `127.0.0.1:8382` | Address the HTTP API listens on; `$DUBD_ADDR` changes the default    |
+| `-name`        |                  | Name of this instance when running several; keeps its tab separate   |
 | `-cmux`        |                  | Path to the cmux CLI; by default `$PATH`, then the cmux app          |
 
 ## HTTP API
