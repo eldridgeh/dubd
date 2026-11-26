@@ -1,10 +1,31 @@
 # dubd
 
+[![CI](https://github.com/eldridgeh/dubd/actions/workflows/ci.yml/badge.svg)](https://github.com/eldridgeh/dubd/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/eldridgeh/dubd.svg)](https://pkg.go.dev/github.com/eldridgeh/dubd)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A small Go daemon that plays a continuous stream of dub in a
 [cmux](https://cmux.com) browser tab and scales its tempo to an integer you
 give it, such as code merges landed per hour. A slow drag means not much is
 landing. A quick skank means the queue is moving. Silence means the daemon
 has stopped.
+
+## Quick start
+
+In a terminal tab inside cmux:
+
+```sh
+go install github.com/eldridgeh/dubd@latest
+dubd run -metric-cmd 'your-command-that-prints-landings-per-hour'
+```
+
+A browser tab opens beside your terminal and the dub starts within about 15
+seconds. `dubd` runs the command every 30 seconds and the tempo follows the
+number it prints. No command to hand? Run `dubd run` and push the number in
+with `dubd set 7` or an HTTP `PUT` (see [Run](#run)).
+
+One binary, no dependencies outside the Go standard library, no
+configuration file.
 
 ## How it works
 
