@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -387,5 +388,32 @@ func TestSetStreamWhileSearching(t *testing.T) {
 	steps(p, c, 2)
 	if len(f.gotos) != 1 || f.gotos[0] != link || p.Status().Phase != phasePlaying {
 		t.Fatalf("gotos %q status %+v", f.gotos, p.Status())
+	}
+}
+
+func TestStreamSwitchIsRetriedAfterAFailure(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "surface")
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "q"}, SurfaceFile: file}, f, 5)
+	steps(p, c, 4)
+
+	link := "https://music.youtube.com/watch?list=PL123"
+	f.err = cmux.ErrUnavailable
+	p.SetStream(Stream{URL: link})
+	steps(p, c, 5)
+	if p.Status().Error == "" {
+		t.Fatal("the failed switch was not reported")
+	}
+	if saved, _ := os.ReadFile(file); strings.Contains(string(saved), link) {
+		t.Fatalf("the new stream was recorded before it loaded: %q", saved)
+	}
+
+	f.err = nil
+	steps(p, c, 2)
+	if got := f.gotos[len(f.gotos)-1]; got != link || p.Status().Error != "" {
+		t.Fatalf("after cmux came back: last goto %q status %+v", got, p.Status())
+	}
+	if saved, _ := os.ReadFile(file); !strings.Contains(string(saved), link) {
+		t.Fatalf("the new stream was not recorded: %q", saved)
 	}
 }

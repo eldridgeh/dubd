@@ -143,6 +143,7 @@ type Player struct {
 
 	// The fields below belong to the loop goroutine alone.
 	pausedNow    bool
+	pending      bool   // a new stream is still to be loaded
 	src          Stream // the stream the loop is working on
 	phase        string
 	phaseSince   time.Time
@@ -298,13 +299,12 @@ func (p *Player) Step(ctx context.Context) {
 	paused := p.paused
 	next := p.next
 	p.next = false
-	switched := p.src != p.stream
-	if switched {
+	if p.src != p.stream {
 		p.src, p.pick, p.seed = p.stream, 0, ""
 	}
 	p.mu.Unlock()
-	if switched {
-		p.saveSurface()
+	if next {
+		p.pending = true
 	}
 	if p.pausedNow && !paused {
 		p.lastProgress = p.now() // resuming is not a stall
@@ -320,9 +320,14 @@ func (p *Player) Step(ctx context.Context) {
 	switch {
 	case p.phase == phaseOpening:
 		err = p.open(ctx)
-	case next:
-		p.log.Info("starting another stream", "url", p.src.URL, "query", p.src.Query)
-		err = p.restart(ctx)
+	case p.pending:
+		// Stays pending until the navigation succeeds, so a failure is
+		// retried on the next step, and only then is the stream recorded.
+		if err = p.restart(ctx); err == nil {
+			p.pending = false
+			p.saveSurface()
+			p.log.Info("started another stream", "url", p.src.URL, "query", p.src.Query)
+		}
 	case p.phase == phaseSearching:
 		err = p.search(ctx)
 	case p.phase == phasePlaying:
@@ -346,7 +351,7 @@ func (p *Player) open(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	p.surface = surface
+	p.surface, p.pending = surface, false
 	p.saveSurface()
 	p.log.Info("opened browser surface", "surface", surface, "url", p.startURL())
 	if p.src.URL != "" {
@@ -379,13 +384,8 @@ func (p *Player) adopt(ctx context.Context) bool {
 	// Give it a few seconds to show it is playing before starting over.
 	p.lastProgress = p.now().Add(5*time.Second - p.cfg.StallAfter)
 	p.log.Info("reusing browser surface", "surface", surface)
-	if was != p.streamKey() {
-		// The tab is playing what an earlier run was asked for.
-		p.saveSurface()
-		if err := p.restart(ctx); err != nil {
-			p.log.Error("cmux", "error", err)
-		}
-	}
+	// The tab may be playing what an earlier run was asked for.
+	p.pending = was != p.streamKey()
 	return true
 }
 
