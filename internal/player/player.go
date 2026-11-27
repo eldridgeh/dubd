@@ -173,7 +173,8 @@ type Player struct {
 	page         page
 	playing      string // title last logged
 	cand         Track  // track the page shows, until it has held steady
-	candSeen     int
+	candSeen     int     // checks on which it was playing
+	candPos      float64 // where playback was on the last check
 	told         string // track last passed to OnTrack
 	lastErr      string
 
@@ -555,19 +556,26 @@ func (p *Player) play(ctx context.Context) error {
 	return p.restart(ctx)
 }
 
-// track tells OnTrack about a track once the page has shown the same track
-// and title three times running: the address and the title do not change
-// in the same instant when one track follows another.
+// track tells OnTrack about a track once it has been heard: the page has
+// shown the same track and title while playback moved forward on two checks
+// running. A track that is loaded and never plays is not reported, and
+// neither is the mix of old and new that the page shows for a moment when
+// one track follows another.
 func (p *Player) track(pg page) {
 	if p.cfg.OnTrack == nil || pg.Ad || !pg.Video || pg.ID == "" || pg.Title == "" {
 		return
 	}
 	t := Track{ID: pg.ID, Title: pg.Title, By: pg.Artist}
 	if t != p.cand {
-		p.cand, p.candSeen = t, 1
+		p.cand, p.candSeen, p.candPos = t, 0, pg.Time
 		return
 	}
-	if p.candSeen++; p.candSeen == 3 && t.ID != p.told {
+	moved := !pg.Paused && pg.Time > p.candPos
+	p.candPos = pg.Time
+	if !moved {
+		return
+	}
+	if p.candSeen++; p.candSeen == 2 && t.ID != p.told {
 		p.told = t.ID
 		p.cfg.OnTrack(t)
 	}

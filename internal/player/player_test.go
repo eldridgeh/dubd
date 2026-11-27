@@ -586,3 +586,29 @@ func TestSearchWithNoResultsClosesItsTab(t *testing.T) {
 		t.Fatal("expected the error from cmux")
 	}
 }
+
+func TestATrackThatHasNotPlayedIsNotReported(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	var played []Track
+	cfg := Config{Stream: Stream{Query: "x"}, OnTrack: func(tr Track) { played = append(played, tr) }}
+	p, c := newTest(t, cfg, f, 5)
+
+	// Loaded while paused: the page names a track, and nothing plays.
+	p.SetPaused(true)
+	steps(p, c, 10)
+	if len(played) != 0 {
+		t.Fatalf("a paused track was reported: %+v", played)
+	}
+	// Not paused, and not advancing either.
+	f.stuck = true
+	p.SetPaused(false)
+	steps(p, c, 10)
+	if len(played) != 0 {
+		t.Fatalf("a stalled track was reported: %+v", played)
+	}
+	f.stuck = false
+	steps(p, c, 4)
+	if len(played) != 1 || played[0].ID != "aaaaaaaaaaa" {
+		t.Fatalf("played = %+v", played)
+	}
+}
