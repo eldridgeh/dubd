@@ -123,7 +123,10 @@ const findJS = `(() => {
     const m = /[?&]v=([\w-]{11})/.exec(a.getAttribute('href') || '');
     if (!m) continue;
     const row = a.closest('ytmusic-responsive-list-item-renderer');
-    const t = {id: m[1], title: clean(a), by: clean(row && row.querySelector('.secondary-flex-columns'))};
+    // The line under the title is several pieces, such as "Song", the
+    // artist and the play count.
+    const by = row ? [...row.querySelectorAll('.secondary-flex-columns yt-formatted-string')].map(clean).filter(Boolean).join(' • ') : '';
+    const t = {id: m[1], title: clean(a), by: by};
     const seen = tracks.find((x) => x.id === t.id);
     if (!seen) tracks.push(t);
     else if (!seen.title) { seen.title = t.title; seen.by = seen.by || t.by; }
