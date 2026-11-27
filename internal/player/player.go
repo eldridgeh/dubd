@@ -85,6 +85,10 @@ type Config struct {
 	StaleAfter time.Duration
 	// SurfaceFile remembers the browser surface between runs. Empty does not.
 	SurfaceFile string
+	// OnResults is told what a search returned, when set.
+	OnResults func(query string, tracks []Track)
+	// OnTrack is told each track that plays, when set.
+	OnTrack func(Track)
 }
 
 // Defaults fills unset timings.
@@ -167,8 +171,14 @@ type Player struct {
 	lastPos      float64
 	lastProgress time.Time
 	page         page
-	playing      string // title last logged
+	playing      string  // title last logged
+	cand         Track   // track the page shows, until it has held steady
+	candSeen     int     // checks on which it was playing
+	candPos      float64 // where playback was on the last check
+	told         string  // track last passed to OnTrack
 	lastErr      string
+
+	searchMu sync.Mutex // one Search at a time
 }
 
 // New returns a player with the given starting metric.
@@ -284,8 +294,48 @@ func (p *Player) stop() {
 	_ = p.b.Eval(ctx, surface, tickScript(want{Rate: rate, KeepPitch: p.cfg.KeepPitch, Play: false}), &pg)
 }
 
-func (p *Player) searchURL() string {
-	return "https://music.youtube.com/search?q=" + url.QueryEscape(p.src.Query)
+func (p *Player) searchURL() string { return searchURL(p.src.Query) }
+
+func searchURL(query string) string {
+	return "https://music.youtube.com/search?q=" + url.QueryEscape(query)
+}
+
+// MaxResults is how many results of a search are kept.
+const MaxResults = 20
+
+// Search looks words up on YouTube Music in a tab of its own, so that what
+// is playing carries on, and returns the tracks found.
+func (p *Player) Search(ctx context.Context, query string) ([]Track, error) {
+	p.searchMu.Lock()
+	defer p.searchMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, p.cfg.SearchTimeout)
+	defer cancel()
+	surface, err := p.b.Open(ctx, searchURL(query))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.b.Close(c, surface); err != nil {
+			p.log.Warn("could not close the search tab", "surface", surface, "error", err)
+		}
+	}()
+	for {
+		var f found
+		err := p.b.Eval(ctx, surface, findJS, &f)
+		if err == nil && len(f.Tracks) > 0 {
+			return f.Tracks[:min(len(f.Tracks), MaxResults)], nil
+		}
+		select {
+		case <-ctx.Done():
+			if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				err = errors.New("the search page showed no tracks")
+			}
+			return nil, err
+		case <-time.After(p.cfg.Tick):
+		}
+	}
 }
 
 func (p *Player) startURL() string {
@@ -295,9 +345,14 @@ func (p *Player) startURL() string {
 	return p.searchURL()
 }
 
-// radioURL is the endless "radio" queue YouTube Music builds from one track.
-func radioURL(id string) string {
-	return "https://music.youtube.com/watch?v=" + id + "&list=" + radioPrefix + id
+// RadioURL is the endless "radio" queue YouTube Music builds from one track.
+func RadioURL(id string) string {
+	return TrackURL(id) + "&list=" + radioPrefix + id
+}
+
+// TrackURL plays one track by itself.
+func TrackURL(id string) string {
+	return "https://music.youtube.com/watch?v=" + id
 }
 
 const radioPrefix = "RDAMVM"
@@ -447,7 +502,7 @@ func (p *Player) search(ctx context.Context) error {
 	if err := p.b.Eval(ctx, p.surface, findJS, &f); err != nil {
 		return err
 	}
-	if len(f.IDs) == 0 {
+	if len(f.Tracks) == 0 {
 		if p.now().Sub(p.phaseSince) > p.cfg.SearchTimeout {
 			p.log.Warn("search page shows no tracks; reloading", "query", p.src.Query)
 			p.setPhase(phaseSearching)
@@ -457,15 +512,18 @@ func (p *Player) search(ctx context.Context) error {
 	}
 	// Each restart moves on to the next of the top results, and never
 	// straight back to the stream that was just playing.
-	top := f.IDs[:min(len(f.IDs), 5)]
-	id := top[p.pick%len(top)]
+	if p.cfg.OnResults != nil {
+		p.cfg.OnResults(p.src.Query, f.Tracks[:min(len(f.Tracks), MaxResults)])
+	}
+	top := f.Tracks[:min(len(f.Tracks), 5)]
+	id := top[p.pick%len(top)].ID
 	if id == p.seed && len(top) > 1 {
 		p.pick++
-		id = top[p.pick%len(top)]
+		id = top[p.pick%len(top)].ID
 	}
 	p.pick++
 	p.seed = id
-	if err := p.b.Goto(ctx, p.surface, radioURL(id)); err != nil {
+	if err := p.b.Goto(ctx, p.surface, RadioURL(id)); err != nil {
 		return err
 	}
 	p.log.Info("starting stream", "track", id)
@@ -487,6 +545,7 @@ func (p *Player) play(ctx context.Context) error {
 		p.log.Info("now playing", "title", pg.Title, "artist", pg.Artist, "rate", p.rate)
 	}
 	p.page = pg
+	p.track(pg)
 	if pg.Video && pg.Time != p.lastPos {
 		p.lastPos, p.lastProgress = pg.Time, p.now()
 	}
@@ -495,6 +554,31 @@ func (p *Player) play(ctx context.Context) error {
 	}
 	p.log.Warn("playback stalled; restarting stream", "page", pg.Host+pg.Path)
 	return p.restart(ctx)
+}
+
+// track tells OnTrack about a track once it has been heard: the page has
+// shown the same track and title while playback moved forward on two checks
+// running. A track that is loaded and never plays is not reported, and
+// neither is the mix of old and new that the page shows for a moment when
+// one track follows another.
+func (p *Player) track(pg page) {
+	if p.cfg.OnTrack == nil || pg.Ad || !pg.Video || pg.ID == "" || pg.Title == "" {
+		return
+	}
+	t := Track{ID: pg.ID, Title: pg.Title, By: pg.Artist}
+	if t != p.cand {
+		p.cand, p.candSeen, p.candPos = t, 0, pg.Time
+		return
+	}
+	moved := !pg.Paused && pg.Time > p.candPos
+	p.candPos = pg.Time
+	if !moved {
+		return
+	}
+	if p.candSeen++; p.candSeen == 2 && t.ID != p.told {
+		p.told = t.ID
+		p.cfg.OnTrack(t)
+	}
 }
 
 // restart loads a fresh stream in the same surface.
