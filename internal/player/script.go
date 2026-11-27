@@ -30,9 +30,11 @@ type page struct {
 	Rate     float64 `json:"rate"`
 	Time     float64 `json:"time"`
 	Duration float64 `json:"duration"`
-	ID       string  `json:"id"`
-	Title    string  `json:"title"`
-	Artist   string  `json:"artist"`
+	// Hidden is whether the page is not on show.
+	Hidden bool   `json:"hidden"`
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
 }
 
 // Track is one track: a search result, or something that was played.
@@ -77,31 +79,19 @@ const tickJS = `(() => {
     out.video = true;
     out.loaded = !!(v.currentSrc || v.src);
     for (const k of ['preservesPitch', 'webkitPreservesPitch']) { if (k in v) v[k] = want.keepPitch; }
-    if (Math.abs(v.playbackRate - want.rate) > 0.0005) {
-      // WebKit drops the audio for a moment whenever the rate changes. Dip
-      // the volume around the change so the drop lands in silence and is
-      // heard as a short swell, not a gap. The dip state lives on the
-      // element so that an overlapping call leaves it alone.
-      if (v.paused || v.muted || v.volume === 0) {
-        v.playbackRate = want.rate;
-      } else if (!v.dataset.dubdDip) {
-        const full = v.volume;
-        // Timed by the clock, so a throttled timer shortens the ramp
-        // instead of stretching it.
-        const ramp = (from, to, ms, done) => {
-          const start = performance.now();
-          const id = setInterval(() => {
-            const k = Math.min(1, (performance.now() - start) / ms);
-            v.volume = Math.max(0, Math.min(1, from + (to - from) * k));
-            if (k >= 1) { clearInterval(id); done(); }
-          }, 15);
-        };
-        v.dataset.dubdDip = '1';
-        ramp(full, 0, 120, () => {
-          v.playbackRate = want.rate;
-          setTimeout(() => ramp(0, full, 250, () => { delete v.dataset.dubdDip; }), 180);
-        });
-      }
+    // A dip in volume that was cut short, by an error or by dubd stopping
+    // part way, is put right here. dubd runs a dip from start to end before
+    // it runs this script again, so a volume still kept on the element
+    // means the dip did not finish.
+    if (v.dataset.dubdVol) {
+      v.volume = Number(v.dataset.dubdVol);
+      delete v.dataset.dubdVol;
+    }
+    // With nothing to be heard the rate is simply set. While sound is
+    // playing dubd changes it inside a dip in volume (see dipJS), which it
+    // starts when it sees the rate reported here is not the one wanted.
+    if (Math.abs(v.playbackRate - want.rate) > 0.0005 && (v.paused || v.muted || v.volume === 0)) {
+      v.playbackRate = want.rate;
     }
     if (want.play && v.paused && out.loaded) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
     if (!want.play && !v.paused) v.pause();
@@ -110,9 +100,14 @@ const tickJS = `(() => {
     out.time = v.currentTime || 0;
     out.duration = isFinite(v.duration) ? v.duration : 0;
   }
+  out.hidden = document.hidden;
   out.signedIn = !document.querySelector('ytmusic-nav-bar a.sign-in-link, a[href*="accounts.google.com/ServiceLogin"]');
   out.title = text('ytmusic-player-bar .title') || document.title;
-  out.artist = text('ytmusic-player-bar .byline a');
+  // The artist: what the page tells the system's media controls, which
+  // does not depend on how the player bar is laid out, then the bar's
+  // byline, which reads "artist • album • year".
+  const meta = (navigator.mediaSession && navigator.mediaSession.metadata) || {};
+  out.artist = (meta.artist || '').trim() || text('ytmusic-player-bar .byline a') || text('ytmusic-player-bar .byline').split(' • ')[0];
   return JSON.stringify(out);
 })()`
 
@@ -133,6 +128,37 @@ const findJS = `(() => {
   }
   return JSON.stringify({tracks: tracks});
 })()`
+
+// dipJS is one step of a change of tempo. WebKit drops the audio for a
+// moment whenever the playback rate changes, so dubd takes the volume down
+// in a few steps, changes the rate in the silence, and brings the volume
+// back. Each step is one short script and dubd keeps the time between
+// them: timers in the page cannot, because a tab that is not on show has
+// its timers held to about one a second, which stretched the silence to
+// two seconds. The volume to come back to is kept on the element.
+const dipJS = `(() => {
+  const dip = %s;
+  const v = document.querySelector('video');
+  if (!v) return JSON.stringify({ok: false});
+  if (!v.dataset.dubdVol) v.dataset.dubdVol = String(v.volume);
+  v.volume = Math.max(0, Math.min(1, Number(v.dataset.dubdVol) * dip.volume));
+  if (dip.rate) v.playbackRate = dip.rate;
+  if (dip.last) delete v.dataset.dubdVol;
+  return JSON.stringify({ok: true});
+})()`
+
+// dipStep is one step of a dip: the share of the full volume to set, the
+// rate to change to (0 leaves it), and whether the dip ends here.
+type dipStep struct {
+	Volume float64 `json:"volume"`
+	Rate   float64 `json:"rate,omitempty"`
+	Last   bool    `json:"last,omitempty"`
+}
+
+func dipScript(d dipStep) string {
+	b, _ := json.Marshal(d)
+	return fmt.Sprintf(dipJS, b)
+}
 
 func tickScript(w want) string {
 	b, _ := json.Marshal(w)

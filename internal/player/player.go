@@ -72,6 +72,9 @@ type Config struct {
 	// Settle is the shortest time between changes of playback rate, so
 	// that a burst of reports is one change of tempo. Zero does not wait.
 	Settle time.Duration
+	// Dip is how long the dip in volume around a change of tempo lasts.
+	// Zero changes the tempo with no dip.
+	Dip time.Duration
 	// Tick is how often the page is checked and corrected.
 	Tick time.Duration
 	// StallAfter restarts the stream when playback has not advanced this long.
@@ -126,14 +129,20 @@ type Status struct {
 	Stream        Stream    `json:"stream"`
 	Ad            bool      `json:"ad"`
 	SignedIn      bool      `json:"signed_in"`
-	Dialogs       int       `json:"dialogs_accepted"`
-	Surface       string    `json:"surface,omitempty"`
-	Page          string    `json:"page,omitempty"`
-	Title         string    `json:"title,omitempty"`
-	Artist        string    `json:"artist,omitempty"`
-	Position      float64   `json:"position_seconds"`
-	Duration      float64   `json:"duration_seconds"`
-	Error         string    `json:"error,omitempty"`
+	// TempoDip is how long a change of tempo is set to take.
+	TempoDip string `json:"tempo_dip"`
+	// TempoChangeMs is how long the last change of tempo took to make, in
+	// milliseconds, from the first step down in volume to the last step up.
+	TempoChangeMs float64 `json:"tempo_change_ms"`
+	TabHidden     bool    `json:"tab_hidden"`
+	Dialogs       int     `json:"dialogs_accepted"`
+	Surface       string  `json:"surface,omitempty"`
+	Page          string  `json:"page,omitempty"`
+	Title         string  `json:"title,omitempty"`
+	Artist        string  `json:"artist,omitempty"`
+	Position      float64 `json:"position_seconds"`
+	Duration      float64 `json:"duration_seconds"`
+	Error         string  `json:"error,omitempty"`
 }
 
 // Player runs the stream.
@@ -150,6 +159,7 @@ type Player struct {
 	paused       bool
 	next         bool
 	dialogs      int // page dialogs accepted
+	dipLen       time.Duration
 	stream       Stream
 
 	status Status // published by the loop after every step
@@ -176,7 +186,11 @@ type Player struct {
 	candSeen     int     // checks on which it was playing
 	candPos      float64 // where playback was on the last check
 	told         string  // track last passed to OnTrack
+	dipMs        float64 // how long the last change of tempo took
 	lastErr      string
+
+	// sleep waits between the steps of a dip; tests replace it.
+	sleep func(ctx context.Context, d time.Duration)
 
 	searchMu sync.Mutex // one Search at a time
 }
@@ -185,9 +199,15 @@ type Player struct {
 func New(cfg Config, b Browser, log *slog.Logger, metric int) *Player {
 	cfg.Defaults()
 	p := &Player{cfg: cfg, b: b, log: log, now: time.Now, phase: phaseOpening}
+	p.sleep = func(ctx context.Context, d time.Duration) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(d):
+		}
+	}
 	p.metric, p.metricSource, p.metricAt = metric, "start", p.now()
 	p.status = Status{Phase: phaseOpening}
-	p.stream, p.src = cfg.Stream, cfg.Stream
+	p.stream, p.src, p.dipLen = cfg.Stream, cfg.Stream, cfg.Dip
 	return p
 }
 
@@ -215,6 +235,21 @@ func (p *Player) Next() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.next = true
+}
+
+// MaxDip is the longest dip in volume a change of tempo may take.
+const MaxDip = 2 * time.Second
+
+// SetDip sets how long the dip in volume around a change of tempo lasts.
+// Zero changes the tempo with no dip.
+func (p *Player) SetDip(d time.Duration) error {
+	if d < 0 || d > MaxDip {
+		return fmt.Errorf("the dip must be from 0 to %s", MaxDip)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dipLen = d
+	return nil
 }
 
 // NoteDialog records that a dialog shown by the page, such as "Leave
@@ -250,6 +285,7 @@ func (p *Player) Status() Status {
 	s.Metric, s.MetricSource, s.MetricUpdated = p.metric, p.metricSource, p.metricAt
 	s.TargetRate, s.MetricStale = p.target()
 	s.Paused, s.Stream, s.Dialogs = p.paused, p.stream, p.dialogs
+	s.TempoDip = p.dipLen.String()
 	return s
 }
 
@@ -260,6 +296,7 @@ func (p *Player) publish() {
 		s.Page = p.page.Host + p.page.Path
 		s.Title, s.Artist, s.Ad = p.page.Title, p.page.Artist, p.page.Ad
 		s.SignedIn = p.page.SignedIn
+		s.TempoChangeMs, s.TabHidden = p.dipMs, p.page.Hidden
 		s.Position, s.Duration = math.Round(p.page.Time), math.Round(p.page.Duration)
 	}
 	p.mu.Lock()
@@ -546,6 +583,14 @@ func (p *Player) play(ctx context.Context) error {
 	}
 	p.page = pg
 	p.track(pg)
+	// The script sets the rate itself when nothing can be heard. With sound
+	// playing it leaves the rate alone and the change is made in a dip.
+	if pg.Video && !pg.Paused && math.Abs(pg.Rate-p.rate) > 0.0005 {
+		if err := p.dip(ctx); err != nil {
+			return err
+		}
+		p.page.Rate = p.rate
+	}
 	if pg.Video && pg.Time != p.lastPos {
 		p.lastPos, p.lastProgress = pg.Time, p.now()
 	}
@@ -554,6 +599,65 @@ func (p *Player) play(ctx context.Context) error {
 	}
 	p.log.Warn("playback stalled; restarting stream", "page", pg.Host+pg.Path)
 	return p.restart(ctx)
+}
+
+// dipPlan lays out a dip of the given length: the volume steps down, the
+// rate changes in silence, and the volume steps back up. The steps are
+// shares of the full volume, closer together near silence, where a step is
+// easiest to hear. A short dip has fewer steps, because a step cannot be
+// quicker than cmux takes to run it, about 60 ms. No length is no dip: the
+// rate alone changes.
+func dipPlan(length time.Duration, rate float64) (steps []dipStep, every, hold time.Duration) {
+	if length <= 0 {
+		return []dipStep{{Volume: 1, Rate: rate, Last: true}}, 0, 0
+	}
+	down, up := []float64{0.45, 0.15, 0}, []float64{0.15, 0.45, 1}
+	if length < 400*time.Millisecond {
+		down, up = []float64{0.3, 0}, []float64{0.3, 1}
+	}
+	for _, v := range down {
+		steps = append(steps, dipStep{Volume: v})
+	}
+	steps[len(steps)-1].Rate = rate
+	for _, v := range up {
+		steps = append(steps, dipStep{Volume: v})
+	}
+	steps[len(steps)-1].Last = true
+	// A third of the time is the silence; the steps share the rest.
+	hold = length / 3
+	every = (length - hold) / time.Duration(len(steps)-2)
+	return steps, every, hold
+}
+
+// dip changes the playback rate to p.rate inside a short dip in volume.
+// If it is cut short the next check of the page restores the volume.
+func (p *Player) dip(ctx context.Context) error {
+	p.mu.Lock()
+	length := p.dipLen
+	p.mu.Unlock()
+	steps, every, hold := dipPlan(length, p.rate)
+	began := time.Now()
+	for _, d := range steps {
+		start := time.Now()
+		var res struct {
+			OK bool `json:"ok"`
+		}
+		if err := p.b.Eval(ctx, p.surface, dipScript(d), &res); err != nil {
+			return err
+		}
+		if !res.OK {
+			return nil // no media element any more: nothing to change
+		}
+		wait := every
+		if d.Rate != 0 {
+			wait = hold
+		}
+		if !d.Last {
+			p.sleep(ctx, wait-time.Since(start))
+		}
+	}
+	p.dipMs = math.Round(float64(time.Since(began).Microseconds()) / 1000)
+	return nil
 }
 
 // track tells OnTrack about a track once it has been heard: the page has

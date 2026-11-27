@@ -19,30 +19,39 @@ import (
 
 // fakeBrowser stands in for cmux and a YouTube Music page.
 type fakeBrowser struct {
-	opened []string
-	gotos  []string
-	url    string
-	ids    []string // tracks the search page shows
-	stuck  bool     // playback does not advance
-	ad     bool     // an advert is showing
-	dialog bool     // the page shows a dialog and answers nothing else
-	closed []string // surfaces closed
-	gone   bool     // the surface no longer exists
-	err    error    // every call fails with this
-	pos    float64
-	last   want
-	track  string // track the page says is playing, when not the one in the address
-	title  string // its title, when not "Track"
+	opened  []string
+	gotos   []string
+	url     string
+	ids     []string // tracks the search page shows
+	stuck   bool     // playback does not advance
+	ad      bool     // an advert is showing
+	dialog  bool     // the page shows a dialog and answers nothing else
+	closed  []string // surfaces closed
+	gone    bool     // the surface no longer exists
+	err     error    // every call fails with this
+	pos     float64
+	last    want
+	track   string  // track the page says is playing, when not the one in the address
+	rate    float64 // the media element's playback rate
+	vol     float64 // share of the full volume, as the last step of a dip left it
+	muted   bool
+	dips    []dipStep // steps of dips, in order
+	dipErr  int       // fail the dip step with this number, counting from 1
+	dipOpen bool      // a dip began and has not ended: the full volume is kept on the element
+	title   string    // its title, when not "Track"
 }
 
-var wantRE = regexp.MustCompile(`const want = (\{.*?\});`)
+var (
+	wantRE = regexp.MustCompile(`const want = (\{.*?\});`)
+	dipRE  = regexp.MustCompile(`const dip = (\{.*?\});`)
+)
 
 func (f *fakeBrowser) Open(_ context.Context, url string) (string, error) {
 	if f.err != nil {
 		return "", f.err
 	}
 	f.opened = append(f.opened, url)
-	f.url, f.gone = url, false
+	f.url, f.gone, f.rate, f.vol = url, false, 1, 1
 	return "surface:" + string(rune('0'+len(f.opened))), nil
 }
 
@@ -71,7 +80,7 @@ func (f *fakeBrowser) Goto(_ context.Context, _ string, url string) error {
 		return errors.New("not_found: surface")
 	}
 	f.gotos = append(f.gotos, url)
-	f.url, f.pos = url, 0
+	f.url, f.pos, f.rate = url, 0, 1
 	return nil
 }
 
@@ -86,13 +95,35 @@ func (f *fakeBrowser) Eval(_ context.Context, _ string, script string, out any) 
 		return errors.New("Command timed out")
 	}
 	var res any
-	if m := wantRE.FindStringSubmatch(script); m != nil {
+	if m := dipRE.FindStringSubmatch(script); m != nil {
+		var d dipStep
+		if err := json.Unmarshal([]byte(m[1]), &d); err != nil {
+			return err
+		}
+		f.dips = append(f.dips, d)
+		if len(f.dips) == f.dipErr {
+			return errors.New("Command timed out")
+		}
+		f.vol, f.dipOpen = d.Volume, !d.Last
+		if d.Rate != 0 {
+			f.rate = d.Rate
+		}
+		res = map[string]bool{"ok": strings.Contains(f.url, "/watch")}
+	} else if m := wantRE.FindStringSubmatch(script); m != nil {
 		if err := json.Unmarshal([]byte(m[1]), &f.last); err != nil {
 			return err
 		}
 		watching := strings.Contains(f.url, "/watch")
+		// A dip that did not finish is put right.
+		if f.dipOpen {
+			f.vol, f.dipOpen = 1, false
+		}
+		// The page sets the rate itself only when nothing can be heard.
+		if !f.last.Play || f.muted {
+			f.rate = f.last.Rate
+		}
 		if watching && f.last.Play && !f.stuck {
-			f.pos += f.last.Rate
+			f.pos += f.rate
 		}
 		list := ""
 		if i := strings.Index(f.url, "list="); i >= 0 {
@@ -107,7 +138,7 @@ func (f *fakeBrowser) Eval(_ context.Context, _ string, script string, out any) 
 			title = "Track"
 		}
 		res = page{Host: "music.youtube.com", Path: "/watch", List: list, Video: watching, Loaded: watching,
-			Paused: !f.last.Play, Rate: f.last.Rate, Time: f.pos, ID: id, Title: title, Ad: f.ad}
+			Paused: !f.last.Play, Rate: f.rate, Time: f.pos, ID: id, Title: title, Ad: f.ad}
 	} else {
 		var tracks []Track
 		if strings.Contains(f.url, "/search") {
@@ -134,6 +165,7 @@ func newTest(t *testing.T, cfg Config, f *fakeBrowser, metric int) (*Player, *cl
 	c := &clock{t: time.Unix(1_700_000_000, 0)}
 	p.now = c.now
 	p.metricAt = c.t
+	p.sleep = func(context.Context, time.Duration) {}
 	return p, c
 }
 
@@ -610,5 +642,142 @@ func TestATrackThatHasNotPlayedIsNotReported(t *testing.T) {
 	steps(p, c, 4)
 	if len(played) != 1 || played[0].ID != "aaaaaaaaaaa" {
 		t.Fatalf("played = %+v", played)
+	}
+}
+
+func TestTempoChangesInsideADip(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "x"}, Dip: 550 * time.Millisecond}, f, 5)
+	steps(p, c, 4)
+	// Metric 5 is rate 1.0, which the page starts at: nothing to change.
+	if len(f.dips) != 0 || f.rate != 1.0 {
+		t.Fatalf("dips = %+v, rate %v", f.dips, f.rate)
+	}
+
+	p.SetMetric(10, "test")
+	steps(p, c, 2)
+	want := []dipStep{{Volume: 0.45}, {Volume: 0.15}, {Volume: 0, Rate: 1.5}, {Volume: 0.15}, {Volume: 0.45}, {Volume: 1, Last: true}}
+	if len(f.dips) != len(want) {
+		t.Fatalf("dips = %+v", f.dips)
+	}
+	for i := range want {
+		if f.dips[i] != want[i] {
+			t.Fatalf("step %d = %+v, want %+v", i+1, f.dips[i], want[i])
+		}
+	}
+	if f.rate != 1.5 || f.vol != 1 || p.Status().Rate != 1.5 {
+		t.Fatalf("after the dip: rate %v, volume %v, status %+v", f.rate, f.vol, p.Status())
+	}
+	// Once the rate is right there is no further dip.
+	steps(p, c, 5)
+	if len(f.dips) != len(want) {
+		t.Fatalf("a dip with nothing to change: %+v", f.dips[len(want):])
+	}
+}
+
+func TestTempoIsSetDirectlyWhenNothingIsHeard(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "x"}}, f, 5)
+	steps(p, c, 4)
+	p.SetPaused(true)
+	p.SetMetric(10, "test")
+	steps(p, c, 3)
+	if len(f.dips) != 0 || f.rate != 1.5 {
+		t.Fatalf("paused: dips = %+v, rate %v", f.dips, f.rate)
+	}
+	p.SetPaused(false)
+	f.muted = true
+	p.SetMetric(0, "test")
+	c.t = c.t.Add(time.Minute)
+	steps(p, c, 3)
+	if len(f.dips) != 0 || f.rate != 0.5 {
+		t.Fatalf("muted: dips = %+v, rate %v", f.dips, f.rate)
+	}
+}
+
+func TestADipCutShortIsTriedAgain(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}, dipErr: 2}
+	p, c := newTest(t, Config{Stream: Stream{Query: "x"}, Dip: 550 * time.Millisecond}, f, 5)
+	steps(p, c, 4)
+	p.SetMetric(10, "test")
+	steps(p, c, 1)
+	if len(f.dips) != 2 || f.rate != 1.0 || p.Status().Error == "" {
+		t.Fatalf("after the failed step: dips %+v, rate %v, error %q", f.dips, f.rate, p.Status().Error)
+	}
+	steps(p, c, 2)
+	if f.rate != 1.5 || f.vol != 1 || p.Status().Error != "" {
+		t.Fatalf("after trying again: rate %v, volume %v, error %q", f.rate, f.vol, p.Status().Error)
+	}
+}
+
+func TestADipCutShortInSilenceIsRestoredAtOnce(t *testing.T) {
+	// The fourth step is the first one back up: the rate has changed and
+	// the volume is at nothing.
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}, dipErr: 4}
+	p, c := newTest(t, Config{Stream: Stream{Query: "x"}, Dip: 550 * time.Millisecond}, f, 5)
+	steps(p, c, 4)
+	p.SetMetric(10, "test")
+	steps(p, c, 1)
+	if f.vol != 0 || f.rate != 1.5 || len(f.dips) != 4 {
+		t.Fatalf("after the failed step: volume %v, rate %v, steps %d", f.vol, f.rate, len(f.dips))
+	}
+	// The very next check restores the volume; no second dip is needed.
+	steps(p, c, 1)
+	if f.vol != 1 || len(f.dips) != 4 {
+		t.Fatalf("one check later: volume %v, steps %d", f.vol, len(f.dips))
+	}
+	if tick := tickScript(want{Rate: 1, Play: true}); strings.Contains(tick, "Date.now") {
+		t.Fatal("the tick script should not wait before restoring the volume")
+	}
+}
+
+func TestDipPlan(t *testing.T) {
+	steps, every, hold := dipPlan(540*time.Millisecond, 1.5)
+	if len(steps) != 6 || steps[2] != (dipStep{Volume: 0, Rate: 1.5}) || !steps[5].Last || steps[5].Volume != 1 ||
+		hold != 180*time.Millisecond || every != 90*time.Millisecond {
+		t.Fatalf("540ms: %+v every %v hold %v", steps, every, hold)
+	}
+	steps, every, hold = dipPlan(240*time.Millisecond, 0.8)
+	if len(steps) != 4 || steps[1] != (dipStep{Volume: 0, Rate: 0.8}) || !steps[3].Last || hold != 80*time.Millisecond || every != 80*time.Millisecond {
+		t.Fatalf("240ms: %+v every %v hold %v", steps, every, hold)
+	}
+	// No dip: the rate changes and the volume is left where it is.
+	steps, _, _ = dipPlan(0, 1.2)
+	if len(steps) != 1 || steps[0] != (dipStep{Volume: 1, Rate: 1.2, Last: true}) {
+		t.Fatalf("0: %+v", steps)
+	}
+}
+
+func TestSetDip(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa"}}
+	p, c := newTest(t, Config{Stream: Stream{Query: "x"}, Dip: 550 * time.Millisecond}, f, 5)
+	steps(p, c, 4)
+	if err := p.SetDip(-time.Second); err == nil {
+		t.Fatal("a negative dip should be refused")
+	}
+	if err := p.SetDip(3 * time.Second); err == nil {
+		t.Fatal("a dip longer than the limit should be refused")
+	}
+	if err := p.SetDip(0); err != nil || p.Status().TempoDip != "0s" {
+		t.Fatalf("SetDip(0) = %v, status %q", err, p.Status().TempoDip)
+	}
+	p.SetMetric(10, "test")
+	steps(p, c, 2)
+	if len(f.dips) != 1 || f.rate != 1.5 || f.vol != 1 {
+		t.Fatalf("with no dip: steps %+v, rate %v, volume %v", f.dips, f.rate, f.vol)
+	}
+}
+
+func TestDipScripts(t *testing.T) {
+	got := dipScript(dipStep{Volume: 0, Rate: 1.25})
+	if !strings.Contains(got, `const dip = {"volume":0,"rate":1.25};`) {
+		t.Fatalf("script = %s", got)
+	}
+	if got := dipScript(dipStep{Volume: 1, Last: true}); !strings.Contains(got, `const dip = {"volume":1,"last":true};`) {
+		t.Fatalf("script = %s", got)
+	}
+	// The page restores the volume itself if a dip never finished.
+	if tick := tickScript(want{Rate: 1, Play: true}); !strings.Contains(tick, "dubdVol") || strings.Contains(tick, "setInterval") || strings.Contains(tick, "setTimeout") {
+		t.Fatalf("the tick script should restore a cut-short dip and use no timers")
 	}
 }

@@ -21,9 +21,18 @@ type fakePlayer struct {
 	nexts  int
 	stream player.Stream
 
+	dip       time.Duration
 	searched  []string
 	found     []player.Track
 	searchErr error
+}
+
+func (f *fakePlayer) SetDip(d time.Duration) error {
+	if d < 0 || d > player.MaxDip {
+		return errors.New("out of range")
+	}
+	f.dip = d
+	return nil
 }
 
 func (f *fakePlayer) Search(_ context.Context, query string) ([]player.Track, error) {
@@ -252,5 +261,20 @@ func TestSavedStreams(t *testing.T) {
 	}
 	if w := do(t, h, "GET", "/history", ""); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "[]" {
 		t.Fatalf("GET /history: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestDip(t *testing.T) {
+	p := &fakePlayer{}
+	h, _, _ := newAPI(p)
+	for body, want := range map[string]time.Duration{"300ms": 300 * time.Millisecond, "0": 0, " 1s\n": time.Second} {
+		if w := do(t, h, "PUT", "/dip", body); w.Code != 200 || p.dip != want {
+			t.Errorf("PUT /dip %q: %d, dip %v", body, w.Code, p.dip)
+		}
+	}
+	for _, bad := range []string{"", "fast", "300", "-1s", "5s"} {
+		if w := do(t, h, "POST", "/dip", bad); w.Code != 400 {
+			t.Errorf("POST /dip %q = %d, want 400", bad, w.Code)
+		}
 	}
 }

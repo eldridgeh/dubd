@@ -68,6 +68,8 @@ Usage:
   dubd status          print the running daemon's state
   dubd pause | play    pause or resume the stream
   dubd next            move to another stream
+  dubd dip <time>      how long the dip in volume around a change of tempo
+                       lasts, such as 300ms; 0 for none
   dubd stream <link | search words>
                        play something else: a YouTube Music link, or a search
   dubd search <words>  list what a search finds, without changing the music
@@ -104,7 +106,7 @@ func main() {
 		err = client(args, "play")
 	case "next":
 		err = client(args, "next")
-	case "stream", "search", "history", "saved", "save", "unsave":
+	case "stream", "search", "history", "saved", "save", "unsave", "dip":
 		err = client(args, cmd)
 	case "version", "--version":
 		fmt.Println("dubd", buildVersion())
@@ -140,6 +142,7 @@ func run(args []string) error {
 		metricFile = fs.String("metric-file", "", "file that holds the metric; read every -interval")
 		interval   = fs.Duration("interval", 30*time.Second, "how often -metric-cmd or -metric-file is read")
 		staleAfter = fs.Duration("stale-after", 0, "play at rate-min when the metric has not been updated this long (0 never)")
+		dip        = fs.Duration("dip", 550*time.Millisecond, "how long the dip in volume around a change of tempo lasts (0 for none)")
 		settle     = fs.Duration("settle", 10*time.Second, "shortest time between tempo changes, so a burst of reports is one change")
 		combine    = fs.String("combine", "sum", "how agents' numbers become the metric: sum, avg or max")
 		agentTTL   = fs.Duration("agent-ttl", 0, "drop an agent that has not reported for this long (0 never)")
@@ -166,6 +169,8 @@ func run(args []string) error {
 		return errors.New("use -metric-cmd or -metric-file, not both")
 	case *name != "" && !nameRE.MatchString(*name):
 		return errors.New("-name may use letters, digits, dot, dash and underscore, up to 64 characters")
+	case *dip < 0 || *dip > player.MaxDip:
+		return fmt.Errorf("-dip must be from 0 to %s", player.MaxDip)
 	case *settle < 0:
 		return errors.New("-settle must not be negative")
 	case *agentTTL < 0:
@@ -210,7 +215,7 @@ func run(args []string) error {
 
 	cfg := player.Config{
 		Stream: stream, Curve: curve, KeepPitch: !*tape,
-		Settle: *settle, StaleAfter: *staleAfter, SurfaceFile: surfaceFile(*name),
+		Dip: *dip, Settle: *settle, StaleAfter: *staleAfter, SurfaceFile: surfaceFile(*name),
 		OnResults: func(query string, tracks []player.Track) {
 			if _, err := lib.SetResults(query, tracks); err != nil {
 				log.Error("writing the library", "error", err)
@@ -392,6 +397,14 @@ func client(args []string, cmd string) error {
 			return fmt.Errorf("usage: dubd stream [-addr host:port] <link | search words>: %w", err)
 		}
 		method = http.MethodPut
+	case "dip":
+		if fs.NArg() != 1 {
+			return errors.New("usage: dubd dip [-addr host:port] <time, such as 300ms, or 0>")
+		}
+		if _, err := time.ParseDuration(fs.Arg(0)); err != nil {
+			return fmt.Errorf("usage: dubd dip <time, such as 300ms, or 0>: %w", err)
+		}
+		method, body = http.MethodPut, fs.Arg(0)
 	case "search":
 		// No words lists the last search again.
 		if body = strings.Join(fs.Args(), " "); body == "" {
