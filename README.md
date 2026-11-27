@@ -223,10 +223,15 @@ The defaults:
 Change the range with `-metric-min`, `-metric-max`, `-rate-min` and
 `-rate-max`. Rates from 0.25x to 4x are accepted.
 
-The rate changes in one step when the metric changes, with a half-second dip in
-volume around it. The browser engine cmux uses (WebKit) drops the audio for a
-moment whenever the playback rate changes; the dip puts that drop in silence,
-so a tempo change sounds like a short swell and not a skip.
+The rate changes in one step when the metric changes, inside a dip in volume
+of about half a second. The browser engine cmux uses (WebKit) drops the audio
+for a moment whenever the playback rate changes; the dip puts that drop in
+silence, so a tempo change sounds like a short swell and not a skip. `dubd`
+times the dip itself, so it is the same length whether or not the tab is on
+screen. `dubd status` shows how long the last one took as `tempo_change_ms`.
+`dubd dip 250ms` shortens the dip while running and `dubd dip 0` turns it off,
+leaving only the browser's own short dropout; `-dip` on `dubd run` sets it at
+start.
 
 Pitch is held steady by default, so only the tempo moves. With `-tape` the
 pitch follows the tempo, like slowing down a tape machine, which makes the
@@ -248,6 +253,7 @@ difference easier to hear from across the room.
 | `-metric-file` |                  | File that holds the metric                                           |
 | `-interval`    | `30s`            | How often the command or file is read                                |
 | `-stale-after` | `0` (never)      | Drop to `-rate-min` when the metric has not been updated this long   |
+| `-dip`         | `550ms`          | Length of the dip in volume around a tempo change; `0` for none      |
 | `-settle`      | `10s`            | Shortest time between tempo changes                                  |
 | `-combine`     | `sum`            | How agents' numbers become the metric: `sum`, `avg` or `max`         |
 | `-agent-ttl`   | `0` (never)      | Drop an agent that has not reported for this long                    |
@@ -273,6 +279,7 @@ The API listens on localhost only.
 | `POST /pause`        | Pause the stream                                   |
 | `POST /play`         | Resume the stream                                  |
 | `POST /next`         | Move to another stream                             |
+| `PUT /dip`           | Length of the dip around a tempo change; the body is a time such as `300ms`, or `0` (or `POST`) |
 | `PUT /stream`        | Play something else; the body is a link, search words, a saved name or a result number (or `POST`) |
 | `GET /search`        | The results of the last search                     |
 | `POST /search`       | Search; the body is the words                      |

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/eldridgeh/dubd/internal/library"
 	"github.com/eldridgeh/dubd/internal/metric"
@@ -21,6 +22,7 @@ type Player interface {
 	Next()
 	SetStream(s player.Stream)
 	Status() player.Status
+	SetDip(d time.Duration) error
 	// Search looks words up without disturbing what is playing.
 	Search(ctx context.Context, query string) ([]player.Track, error)
 }
@@ -57,6 +59,8 @@ type Counting struct {
 //	POST /next            move to another stream
 //	PUT  /stream          play something else (POST also works); the body is a link,
 //	                      search words, a saved name, or the number of a search result
+//	PUT  /dip             how long the dip in volume around a change of tempo
+//	                      lasts (POST also works); the body is a length of time, or 0
 //
 // The library:
 //
@@ -167,6 +171,24 @@ func New(p Player, board *metric.Board, lib *library.Library, version string) ht
 	}
 	mux.HandleFunc("PUT /stream", setStream)
 	mux.HandleFunc("POST /stream", setStream)
+
+	setDip := func(w http.ResponseWriter, r *http.Request) {
+		body, ok := text(w, r)
+		if !ok {
+			return
+		}
+		d, err := time.ParseDuration(body)
+		if err == nil {
+			err = p.SetDip(d)
+		}
+		if err != nil {
+			http.Error(w, "the body must be a length of time such as 300ms, or 0: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		status(w)
+	}
+	mux.HandleFunc("PUT /dip", setDip)
+	mux.HandleFunc("POST /dip", setDip)
 
 	mux.HandleFunc("GET /search", func(w http.ResponseWriter, _ *http.Request) { reply(w, lib.Results()) })
 	mux.HandleFunc("POST /search", func(w http.ResponseWriter, r *http.Request) {
