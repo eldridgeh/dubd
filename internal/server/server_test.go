@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,8 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eldridgeh/dubd/internal/library"
 	"github.com/eldridgeh/dubd/internal/metric"
-
 	"github.com/eldridgeh/dubd/internal/player"
 )
 
@@ -18,6 +20,15 @@ type fakePlayer struct {
 	paused bool
 	nexts  int
 	stream player.Stream
+
+	searched  []string
+	found     []player.Track
+	searchErr error
+}
+
+func (f *fakePlayer) Search(_ context.Context, query string) ([]player.Track, error) {
+	f.searched = append(f.searched, query)
+	return f.found, f.searchErr
 }
 
 func (f *fakePlayer) Next()                     { f.nexts++ }
@@ -25,7 +36,7 @@ func (f *fakePlayer) SetStream(s player.Stream) { f.stream = s }
 
 func (f *fakePlayer) SetPaused(paused bool) { f.paused = paused }
 func (f *fakePlayer) Status() player.Status {
-	return player.Status{Paused: f.paused, Phase: "playing"}
+	return player.Status{Paused: f.paused, Phase: "playing", Stream: f.stream}
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string, header ...string) *httptest.ResponseRecorder {
@@ -44,7 +55,11 @@ func newAPI(p *fakePlayer) (http.Handler, *metric.Board, *[]string) {
 	board := metric.NewBoard(0, metric.Sum, 0, time.Hour)
 	var changes []string
 	board.OnChange = func(total int, source string) { changes = append(changes, fmt.Sprintf("%d %s", total, source)) }
-	return New(p, board, "test"), board, &changes
+	lib, err := library.Open("")
+	if err != nil {
+		panic(err)
+	}
+	return New(p, board, lib, "test"), board, &changes
 }
 
 func TestMetric(t *testing.T) {
@@ -150,5 +165,92 @@ func TestWebPagesAreRefused(t *testing.T) {
 	w := do(t, h, "POST", "/metric", "99", "Origin", "https://example.com")
 	if w.Code != http.StatusForbidden || board.Total() != 0 {
 		t.Fatalf("code %d total %d", w.Code, board.Total())
+	}
+}
+
+func TestSearchThenPickByNumber(t *testing.T) {
+	p := &fakePlayer{found: []player.Track{{ID: "aaaaaaaaaaa", Title: "One", By: "A"}, {ID: "bbbbbbbbbbb", Title: "Two"}}}
+	h, _, _ := newAPI(p)
+
+	if w := do(t, h, "PUT", "/stream", "2"); w.Code != 400 || !strings.Contains(w.Body.String(), "dubd search") {
+		t.Fatalf("a number before any search: %d %s", w.Code, w.Body)
+	}
+	if w := do(t, h, "POST", "/search", "  "); w.Code != 400 || len(p.searched) != 0 {
+		t.Fatalf("an empty search: %d, searched %q", w.Code, p.searched)
+	}
+	w := do(t, h, "POST", "/search", "heavy dub techno\n")
+	var r library.Results
+	if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil || w.Code != 200 {
+		t.Fatalf("POST /search: %d %s (%v)", w.Code, w.Body, err)
+	}
+	if p.searched[0] != "heavy dub techno" || r.Query != "heavy dub techno" || len(r.Tracks) != 2 ||
+		r.Tracks[0].Link != "https://music.youtube.com/watch?v=aaaaaaaaaaa" {
+		t.Fatalf("searched %q, results %+v", p.searched, r)
+	}
+	if w := do(t, h, "GET", "/search", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"title": "Two"`) {
+		t.Fatalf("GET /search: %d %s", w.Code, w.Body)
+	}
+	if w := do(t, h, "PUT", "/stream", "2"); w.Code != 200 || p.stream.URL != "https://music.youtube.com/watch?v=bbbbbbbbbbb&list=RDAMVMbbbbbbbbbbb" {
+		t.Fatalf("pick 2: %d, stream %+v", w.Code, p.stream)
+	}
+	if w := do(t, h, "PUT", "/stream", "3"); w.Code != 400 {
+		t.Fatalf("pick 3 of 2: %d", w.Code)
+	}
+
+	// A search that fails keeps the results there were.
+	p.searchErr = errors.New("the search page showed no tracks")
+	if w := do(t, h, "POST", "/search", "nothing"); w.Code != 502 {
+		t.Fatalf("failed search: %d", w.Code)
+	}
+	if w := do(t, h, "GET", "/search", ""); !strings.Contains(w.Body.String(), "heavy dub techno") {
+		t.Fatalf("results after a failed search: %s", w.Body)
+	}
+}
+
+func TestSavedStreams(t *testing.T) {
+	p := &fakePlayer{stream: player.Stream{Query: "ai dub reggae"}}
+	h, _, _ := newAPI(p)
+
+	// No body saves what is playing; a body saves what it names.
+	if w := do(t, h, "PUT", "/saved/usual", ""); w.Code != 200 {
+		t.Fatalf("save current: %d %s", w.Code, w.Body)
+	}
+	if w := do(t, h, "POST", "/saved/mine", "https://music.youtube.com/playlist?list=PL1"); w.Code != 200 {
+		t.Fatalf("save a link: %d %s", w.Code, w.Body)
+	}
+	for _, bad := range []string{"/saved/3", "/saved/has%20space"} {
+		if w := do(t, h, "PUT", bad, ""); w.Code != 400 {
+			t.Errorf("PUT %s = %d, want 400", bad, w.Code)
+		}
+	}
+	if w := do(t, h, "PUT", "/saved/x", "https://example.com/"); w.Code != 400 {
+		t.Fatalf("save a link that is not YouTube: %d", w.Code)
+	}
+	var saved []library.Named
+	w := do(t, h, "GET", "/saved", "")
+	if err := json.Unmarshal(w.Body.Bytes(), &saved); err != nil || len(saved) != 2 ||
+		saved[0] != (library.Named{Name: "mine", Stream: player.Stream{URL: "https://music.youtube.com/watch?list=PL1"}}) ||
+		saved[1].Stream.Query != "ai dub reggae" {
+		t.Fatalf("GET /saved = %s (%v)", w.Body, err)
+	}
+
+	// A saved name plays what was saved, ahead of a search for the word.
+	if w := do(t, h, "PUT", "/stream", "mine"); w.Code != 200 || p.stream.URL != "https://music.youtube.com/watch?list=PL1" {
+		t.Fatalf("play a saved name: %d, stream %+v", w.Code, p.stream)
+	}
+	if w := do(t, h, "PUT", "/stream", "mine too"); w.Code != 200 || p.stream.Query != "mine too" {
+		t.Fatalf("search words that start with a saved name: stream %+v", p.stream)
+	}
+	if w := do(t, h, "DELETE", "/saved/mine", ""); w.Code != 200 {
+		t.Fatalf("unsave: %d", w.Code)
+	}
+	if w := do(t, h, "DELETE", "/saved/mine", ""); w.Code != 404 {
+		t.Fatalf("unsave twice: %d", w.Code)
+	}
+	if w := do(t, h, "PUT", "/stream", "mine"); p.stream.Query != "mine" {
+		t.Fatalf("after unsave the name is search words again: %d, stream %+v", w.Code, p.stream)
+	}
+	if w := do(t, h, "GET", "/history", ""); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "[]" {
+		t.Fatalf("GET /history: %d %s", w.Code, w.Body)
 	}
 }

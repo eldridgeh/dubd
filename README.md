@@ -125,6 +125,50 @@ A link can be a playlist, an album or a single track on YouTube Music or
 YouTube. A playlist that ends starts again from the top. A private playlist
 needs the tab signed in to the account that owns it.
 
+## Search, save and history
+
+`dubd` keeps a small library in one JSON file: the results of the last
+search, streams you saved under a name, and the tracks that have played.
+
+**Pick from a search.** `dubd search` lists what YouTube Music finds, in a
+tab of its own that it closes again, so the music carries on. A number then
+plays the radio of that result:
+
+```sh
+dubd search heavy dub techno
+#   1  Deep Dub Techno Mix — Video • Some Channel • 1.2M views
+#   2  ...
+dubd stream 2                # play result 2
+dubd search                  # show the last results again
+```
+
+**Save a stream under a name** and play it by that name later:
+
+```sh
+dubd save friday             # what is playing now
+dubd save steppers 2         # result 2 of the last search
+dubd save mine 'https://music.youtube.com/playlist?list=...'
+dubd stream friday           # play it
+dubd saved                   # list the names
+dubd unsave friday
+```
+
+**See what played.** Every track is recorded with a link to that one song:
+
+```sh
+dubd history                 # the latest 20; -n 0 lists all that are kept
+# 2026-11-26 18:30  Track title — Artist
+#                   https://music.youtube.com/watch?v=...
+```
+
+With `dubd stream`, a number is always a result of the last search and a
+saved name wins over search words. The file is
+`library.json` in `dubd`'s folder under your configuration directory
+(`~/Library/Application Support/dubd/` on macOS); `dubd run` prints its path
+at start and `-library` puts it somewhere else. It is plain JSON, so you can
+read or edit it while `dubd` is stopped. It keeps the latest 500 tracks, and
+each named instance has its own file.
+
 ## Several instances
 
 To give each agent, team or project its own music, run one instance each.
@@ -210,6 +254,7 @@ difference easier to hear from across the room.
 | `-window`      | `1h`             | Span over which reported landings are counted                        |
 | `-addr`        | `127.0.0.1:8382` | Address the HTTP API listens on; `$DUBD_ADDR` changes the default    |
 | `-name`        |                  | Name of this instance when running several; keeps its tab separate   |
+| `-library`     |                  | JSON file for saved streams, the last search and the tracks played   |
 | `-cmux`        |                  | Path to the cmux CLI; by default `$PATH`, then the cmux app          |
 
 ## HTTP API
@@ -228,7 +273,13 @@ The API listens on localhost only.
 | `POST /pause`        | Pause the stream                                   |
 | `POST /play`         | Resume the stream                                  |
 | `POST /next`         | Move to another stream                             |
-| `PUT /stream`        | Play something else; the body is a link or search words (or `POST`) |
+| `PUT /stream`        | Play something else; the body is a link, search words, a saved name or a result number (or `POST`) |
+| `GET /search`        | The results of the last search                     |
+| `POST /search`       | Search; the body is the words                      |
+| `GET /history`       | The tracks that have played                        |
+| `GET /saved`         | The saved streams                                  |
+| `PUT /saved/{name}`  | Save a stream; the body is as for `/stream`, or empty for what is playing (or `POST`) |
+| `DELETE /saved/{name}` | Remove a saved stream                            |
 
 ## Notes
 

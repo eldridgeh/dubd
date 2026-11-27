@@ -2,12 +2,15 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/eldridgeh/dubd/internal/library"
 	"github.com/eldridgeh/dubd/internal/metric"
 	"github.com/eldridgeh/dubd/internal/player"
 )
@@ -18,6 +21,8 @@ type Player interface {
 	Next()
 	SetStream(s player.Stream)
 	Status() player.Status
+	// Search looks words up without disturbing what is playing.
+	Search(ctx context.Context, query string) ([]player.Track, error)
 }
 
 // Info is what GET /status returns.
@@ -50,15 +55,38 @@ type Counting struct {
 //
 //	POST /pause, /play    pause or resume the stream
 //	POST /next            move to another stream
-//	PUT  /stream          play something else; the body is a link or search words (POST also works)
-func New(p Player, board *metric.Board, version string) http.Handler {
+//	PUT  /stream          play something else (POST also works); the body is a link,
+//	                      search words, a saved name, or the number of a search result
+//
+// The library:
+//
+//	GET    /search           the results of the last search
+//	POST   /search           search; the body is the words
+//	GET    /history          the tracks that have played
+//	GET    /saved            the saved streams
+//	PUT    /saved/{name}     save a stream under a name (POST also works); the body is
+//	                         as for /stream, or empty for what is playing
+//	DELETE /saved/{name}     remove a saved stream
+func New(p Player, board *metric.Board, lib *library.Library, version string) http.Handler {
 	mux := http.NewServeMux()
-	status := func(w http.ResponseWriter) {
+	reply := func(w http.ResponseWriter, v any) {
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 		enc.SetEscapeHTML(false)
-		_ = enc.Encode(Info{Version: version, Status: p.Status(), Counting: Counting{
+		_ = enc.Encode(v)
+	}
+	// text reads a short body; ok is false once an error was sent.
+	text := func(w http.ResponseWriter, r *http.Request) (string, bool) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 2048))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return "", false
+		}
+		return strings.TrimSpace(string(body)), true
+	}
+	status := func(w http.ResponseWriter) {
+		reply(w, Info{Version: version, Status: p.Status(), Counting: Counting{
 			Mode: board.Mode(), Combine: board.Combine(), Window: board.Window().String(), Agents: board.Agents(),
 		}})
 	}
@@ -125,12 +153,11 @@ func New(p Player, board *metric.Board, version string) http.Handler {
 	mux.HandleFunc("POST /pause", func(w http.ResponseWriter, _ *http.Request) { p.SetPaused(true); status(w) })
 	mux.HandleFunc("POST /play", func(w http.ResponseWriter, _ *http.Request) { p.SetPaused(false); status(w) })
 	setStream := func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(io.LimitReader(r.Body, 2048))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		body, ok := text(w, r)
+		if !ok {
 			return
 		}
-		s, err := player.ParseStream(string(body))
+		s, err := lib.Resolve(body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -140,6 +167,67 @@ func New(p Player, board *metric.Board, version string) http.Handler {
 	}
 	mux.HandleFunc("PUT /stream", setStream)
 	mux.HandleFunc("POST /stream", setStream)
+
+	mux.HandleFunc("GET /search", func(w http.ResponseWriter, _ *http.Request) { reply(w, lib.Results()) })
+	mux.HandleFunc("POST /search", func(w http.ResponseWriter, r *http.Request) {
+		query, ok := text(w, r)
+		if !ok {
+			return
+		}
+		if query == "" {
+			http.Error(w, "the body must be the words to search for", http.StatusBadRequest)
+			return
+		}
+		tracks, err := p.Search(r.Context(), query)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if err := lib.SetResults(query, tracks); err != nil {
+			http.Error(w, "could not write the library: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		reply(w, lib.Results())
+	})
+	mux.HandleFunc("GET /history", func(w http.ResponseWriter, _ *http.Request) { reply(w, lib.History()) })
+	mux.HandleFunc("GET /saved", func(w http.ResponseWriter, _ *http.Request) { reply(w, lib.Saved()) })
+	save := func(w http.ResponseWriter, r *http.Request) {
+		body, ok := text(w, r)
+		if !ok {
+			return
+		}
+		s := p.Status().Stream
+		if body != "" {
+			var err error
+			if s, err = lib.Resolve(body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if err := lib.Save(r.PathValue("name"), s); err != nil {
+			code := http.StatusInternalServerError
+			if errors.As(err, new(library.Refused)) {
+				code = http.StatusBadRequest
+			}
+			http.Error(w, err.Error(), code)
+			return
+		}
+		reply(w, lib.Saved())
+	}
+	mux.HandleFunc("PUT /saved/{name}", save)
+	mux.HandleFunc("POST /saved/{name}", save)
+	mux.HandleFunc("DELETE /saved/{name}", func(w http.ResponseWriter, r *http.Request) {
+		ok, err := lib.Unsave(r.PathValue("name"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "no stream is saved under that name", http.StatusNotFound)
+			return
+		}
+		reply(w, lib.Saved())
+	})
 	mux.HandleFunc("POST /next", func(w http.ResponseWriter, _ *http.Request) { p.Next(); status(w) })
 	return localOnly(mux)
 }

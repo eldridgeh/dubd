@@ -31,6 +31,8 @@ type fakeBrowser struct {
 	err    error    // every call fails with this
 	pos    float64
 	last   want
+	track  string // track the page says is playing, when not the one in the address
+	title  string // its title, when not "Track"
 }
 
 var wantRE = regexp.MustCompile(`const want = (\{.*?\});`)
@@ -96,14 +98,24 @@ func (f *fakeBrowser) Eval(_ context.Context, _ string, script string, out any) 
 		if i := strings.Index(f.url, "list="); i >= 0 {
 			list = f.url[i+len("list="):]
 		}
-		res = page{Host: "music.youtube.com", Path: "/watch", List: list, Video: watching, Loaded: watching,
-			Paused: !f.last.Play, Rate: f.last.Rate, Time: f.pos, Title: "Track", Ad: f.ad}
-	} else {
-		ids := f.ids
-		if !strings.Contains(f.url, "/search") {
-			ids = nil
+		id := f.track
+		if m := regexp.MustCompile(`[?&]v=([\w-]{11})`).FindStringSubmatch(f.url); m != nil && id == "" {
+			id = m[1]
 		}
-		res = found{IDs: ids}
+		title := f.title
+		if title == "" {
+			title = "Track"
+		}
+		res = page{Host: "music.youtube.com", Path: "/watch", List: list, Video: watching, Loaded: watching,
+			Paused: !f.last.Play, Rate: f.last.Rate, Time: f.pos, ID: id, Title: title, Ad: f.ad}
+	} else {
+		var tracks []Track
+		if strings.Contains(f.url, "/search") {
+			for _, id := range f.ids {
+				tracks = append(tracks, Track{ID: id, Title: "Title " + id, By: "Artist"})
+			}
+		}
+		res = found{Tracks: tracks}
 	}
 	b, _ := json.Marshal(res)
 	return json.Unmarshal(b, out)
@@ -187,7 +199,7 @@ func TestNextAfterReusingATabMovesOn(t *testing.T) {
 	steps(p2, c2, 2)
 	p2.Next()
 	steps(p2, c2, 3)
-	if got := f.gotos[len(f.gotos)-1]; got != radioURL("bbbbbbbbbbb") {
+	if got := f.gotos[len(f.gotos)-1]; got != RadioURL("bbbbbbbbbbb") {
 		t.Fatalf("next after reuse went to %q", got)
 	}
 }
@@ -211,7 +223,7 @@ func TestStallRestartsWithNextTrack(t *testing.T) {
 	steps(p, c, 14)
 	f.stuck = false
 	steps(p, c, 3)
-	want := []string{radioURL("aaaaaaaaaaa"), "https://music.youtube.com/search?q=q", radioURL("bbbbbbbbbbb")}
+	want := []string{RadioURL("aaaaaaaaaaa"), "https://music.youtube.com/search?q=q", RadioURL("bbbbbbbbbbb")}
 	if strings.Join(f.gotos, " ") != strings.Join(want, " ") {
 		t.Fatalf("gotos = %q, want %q", f.gotos, want)
 	}
@@ -226,7 +238,7 @@ func TestNextStartsAnotherStream(t *testing.T) {
 	steps(p, c, 4)
 	p.Next()
 	steps(p, c, 3)
-	want := []string{radioURL("aaaaaaaaaaa"), "https://music.youtube.com/search?q=q", radioURL("bbbbbbbbbbb")}
+	want := []string{RadioURL("aaaaaaaaaaa"), "https://music.youtube.com/search?q=q", RadioURL("bbbbbbbbbbb")}
 	if strings.Join(f.gotos, " ") != strings.Join(want, " ") || p.Status().Phase != phasePlaying {
 		t.Fatalf("gotos = %q", f.gotos)
 	}
@@ -374,7 +386,7 @@ func TestSetStreamSwitches(t *testing.T) {
 	p.SetStream(Stream{Query: "other words"})
 	steps(p, c, 3)
 	n := len(f.gotos)
-	if f.gotos[n-2] != "https://music.youtube.com/search?q=other+words" || f.gotos[n-1] != radioURL("aaaaaaaaaaa") {
+	if f.gotos[n-2] != "https://music.youtube.com/search?q=other+words" || f.gotos[n-1] != RadioURL("aaaaaaaaaaa") {
 		t.Fatalf("after search words: gotos %q", f.gotos[n-2:])
 	}
 	if len(f.opened) != 1 {
@@ -504,5 +516,73 @@ func TestRateSettlesBetweenChanges(t *testing.T) {
 	steps(p, c, 8)
 	if f.last.Rate != 0.5 {
 		t.Fatalf("rate = %v, want 0.5 once settled", f.last.Rate)
+	}
+}
+
+func TestSearchResultsAndTracksAreReported(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
+	var query string
+	var results, played []Track
+	cfg := Config{Stream: Stream{Query: "ai dub reggae"},
+		OnResults: func(q string, tr []Track) { query, results = q, tr },
+		OnTrack:   func(tr Track) { played = append(played, tr) }}
+	p, c := newTest(t, cfg, f, 5)
+	steps(p, c, 3)
+	if query != "ai dub reggae" || len(results) != 2 || results[1] != (Track{ID: "bbbbbbbbbbb", Title: "Title bbbbbbbbbbb", By: "Artist"}) {
+		t.Fatalf("results for %q = %+v", query, results)
+	}
+	if len(played) != 0 {
+		t.Fatalf("a track was reported before it had held steady: %+v", played)
+	}
+	steps(p, c, 5)
+	if len(played) != 1 || played[0] != (Track{ID: "aaaaaaaaaaa", Title: "Track"}) {
+		t.Fatalf("played = %+v", played)
+	}
+
+	// The radio moves on: the new track is reported once, with the title
+	// that settled, not the one showing while the page changed over.
+	f.track = "ccccccccccc"
+	steps(p, c, 1)
+	f.title = "Second"
+	steps(p, c, 6)
+	if len(played) != 2 || played[1] != (Track{ID: "ccccccccccc", Title: "Second"}) {
+		t.Fatalf("played = %+v", played)
+	}
+
+	// An advert is not a track.
+	f.ad, f.track, f.title = true, "ddddddddddd", "Buy things"
+	steps(p, c, 6)
+	if len(played) != 2 {
+		t.Fatalf("an advert was reported as a track: %+v", played)
+	}
+}
+
+func TestSearchUsesItsOwnTab(t *testing.T) {
+	f := &fakeBrowser{ids: []string{"aaaaaaaaaaa", "bbbbbbbbbbb"}}
+	p, _ := newTest(t, Config{Stream: Stream{Query: "x"}}, f, 5)
+	got, err := p.Search(context.Background(), "heavy dub techno")
+	if err != nil || len(got) != 2 || got[0].Title != "Title aaaaaaaaaaa" {
+		t.Fatalf("Search = %+v, %v", got, err)
+	}
+	if len(f.opened) != 1 || f.opened[0] != "https://music.youtube.com/search?q=heavy+dub+techno" {
+		t.Fatalf("opened = %q", f.opened)
+	}
+	if len(f.closed) != 1 || f.closed[0] != "surface:1" || len(f.gotos) != 0 {
+		t.Fatalf("closed = %q, gotos = %q", f.closed, f.gotos)
+	}
+}
+
+func TestSearchWithNoResultsClosesItsTab(t *testing.T) {
+	f := &fakeBrowser{}
+	p, _ := newTest(t, Config{Stream: Stream{Query: "x"}, Tick: 5 * time.Millisecond, SearchTimeout: 40 * time.Millisecond}, f, 5)
+	if got, err := p.Search(context.Background(), "nothing at all"); err == nil || !strings.Contains(err.Error(), "no tracks") {
+		t.Fatalf("Search = %+v, %v", got, err)
+	}
+	if len(f.closed) != 1 {
+		t.Fatalf("the search tab was left open: closed = %q", f.closed)
+	}
+	f.err = errors.New("Command timed out")
+	if _, err := p.Search(context.Background(), "x"); err == nil {
+		t.Fatal("expected the error from cmux")
 	}
 }

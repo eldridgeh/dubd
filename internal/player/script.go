@@ -30,19 +30,37 @@ type page struct {
 	Rate     float64 `json:"rate"`
 	Time     float64 `json:"time"`
 	Duration float64 `json:"duration"`
+	ID       string  `json:"id"`
 	Title    string  `json:"title"`
 	Artist   string  `json:"artist"`
 }
 
+// Track is one track: a search result, or something that was played.
+type Track struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// By is what the page says beside the title, such as the artist.
+	By string `json:"by,omitempty"`
+	// Link plays the track by itself. Filled in where tracks are kept.
+	Link string `json:"link,omitempty"`
+}
+
 // found is what the find script reports back.
 type found struct {
-	IDs []string `json:"ids"`
+	Tracks []Track `json:"tracks"`
 }
 
 const tickJS = `(() => {
   const want = %s;
   const out = {host: location.hostname, path: location.pathname, video: false};
-  out.list = new URLSearchParams(location.search).get('list') || '';
+  const params = new URLSearchParams(location.search);
+  out.list = params.get('list') || '';
+  out.id = params.get('v') || '';
+  if (!out.id) {
+    const link = document.querySelector('a.ytp-title-link[href*="v="]');
+    const m = link && /[?&]v=([\w-]{11})/.exec(link.getAttribute('href') || '');
+    if (m) out.id = m[1];
+  }
   const text = (sel) => { const el = document.querySelector(sel); return el ? el.textContent.trim().replace(/\s+/g, ' ') : ''; };
   for (const b of document.querySelectorAll('ytmusic-you-there-renderer button, yt-confirm-dialog-renderer #confirm-button button')) {
     if (b.offsetParent !== null) b.click();
@@ -99,12 +117,18 @@ const tickJS = `(() => {
 })()`
 
 const findJS = `(() => {
-  const ids = [];
+  const clean = (el) => el ? el.textContent.trim().replace(/\s+/g, ' ') : '';
+  const tracks = [];
   for (const a of document.querySelectorAll('a[href*="watch?v="]')) {
     const m = /[?&]v=([\w-]{11})/.exec(a.getAttribute('href') || '');
-    if (m && !ids.includes(m[1])) ids.push(m[1]);
+    if (!m) continue;
+    const row = a.closest('ytmusic-responsive-list-item-renderer');
+    const t = {id: m[1], title: clean(a), by: clean(row && row.querySelector('.secondary-flex-columns'))};
+    const seen = tracks.find((x) => x.id === t.id);
+    if (!seen) tracks.push(t);
+    else if (!seen.title) { seen.title = t.title; seen.by = seen.by || t.by; }
   }
-  return JSON.stringify({ids: ids});
+  return JSON.stringify({tracks: tracks});
 })()`
 
 func tickScript(w want) string {

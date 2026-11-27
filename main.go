@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/eldridgeh/dubd/internal/cmux"
+	"github.com/eldridgeh/dubd/internal/library"
 	"github.com/eldridgeh/dubd/internal/metric"
 	"github.com/eldridgeh/dubd/internal/player"
 	"github.com/eldridgeh/dubd/internal/server"
@@ -69,6 +70,16 @@ Usage:
   dubd next            move to another stream
   dubd stream <link | search words>
                        play something else: a YouTube Music link, or a search
+  dubd search <words>  list what a search finds, without changing the music
+  dubd search          list the last search again
+  dubd stream <number> play that result of the last search
+  dubd save <name> [link | search words | number]
+                       keep a stream under a name; with only a name, what is
+                       playing now
+  dubd stream <name>   play a saved stream
+  dubd saved           list the saved streams
+  dubd unsave <name>   remove a saved stream
+  dubd history [-n 20] list the tracks that have played, with their links
   dubd version
 
 Run "dubd run -h" for the daemon's flags.
@@ -93,8 +104,8 @@ func main() {
 		err = client(args, "play")
 	case "next":
 		err = client(args, "next")
-	case "stream":
-		err = client(args, "stream")
+	case "stream", "search", "history", "saved", "save", "unsave":
+		err = client(args, cmd)
 	case "version", "--version":
 		fmt.Println("dubd", buildVersion())
 	case "help", "-h", "--help":
@@ -133,6 +144,7 @@ func run(args []string) error {
 		combine    = fs.String("combine", "sum", "how agents' numbers become the metric: sum, avg or max")
 		agentTTL   = fs.Duration("agent-ttl", 0, "drop an agent that has not reported for this long (0 never)")
 		window     = fs.Duration("window", time.Hour, "span over which reported landings are counted")
+		libPath    = fs.String("library", "", "JSON file that keeps saved streams, the last search and the tracks played (default: in the user's configuration directory, one per -name)")
 		cmuxBin    = fs.String("cmux", "", "path to the cmux CLI (default: $PATH, then the cmux app)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -177,6 +189,13 @@ func run(args []string) error {
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if *libPath == "" {
+		*libPath = libraryFile(*name)
+	}
+	lib, err := library.Open(*libPath)
+	if err != nil {
+		return fmt.Errorf("-library: %w", err)
+	}
 	bin, err := cmux.Find(*cmuxBin)
 	if err != nil {
 		return err
@@ -192,6 +211,16 @@ func run(args []string) error {
 	cfg := player.Config{
 		Stream: stream, Curve: curve, KeepPitch: !*tape,
 		Settle: *settle, StaleAfter: *staleAfter, SurfaceFile: surfaceFile(*name),
+		OnResults: func(query string, tracks []player.Track) {
+			if err := lib.SetResults(query, tracks); err != nil {
+				log.Error("writing the library", "error", err)
+			}
+		},
+		OnTrack: func(t player.Track) {
+			if err := lib.Played(t); err != nil {
+				log.Error("writing the library", "error", err)
+			}
+		},
 	}
 	p := player.New(cfg, browser, log, *start)
 	browser.OnDialog = p.NoteDialog
@@ -202,13 +231,13 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("%w (is dubd already running? a second instance needs its own -addr and -name)", err)
 	}
-	srv := &http.Server{Handler: server.New(p, board, buildVersion()), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: server.New(p, board, lib, buildVersion()), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http", "error", err)
 		}
 	}()
-	log.Info("dubd running", "version", buildVersion(), "name", *name, "api", "http://"+ln.Addr().String(),
+	log.Info("dubd running", "version", buildVersion(), "name", *name, "api", "http://"+ln.Addr().String(), "library", *libPath,
 		"metric", *start, "rate", curve.Rate(*start))
 
 	var src metric.Source
@@ -261,6 +290,19 @@ func surfaceFile(name string) string {
 	return filepath.Join(dir, "dubd", "surface."+name)
 }
 
+// libraryFile is where an instance keeps its saved streams, last search and
+// played tracks. Each named instance has its own.
+func libraryFile(name string) string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	if name == "" {
+		return filepath.Join(dir, "dubd", "library.json")
+	}
+	return filepath.Join(dir, "dubd", "library."+name+".json")
+}
+
 // flagsFirst moves flags ahead of the other arguments, so that
 // "dubd set 3 -from a" works as well as "dubd set -from a 3". Every flag of
 // the client commands takes a value.
@@ -297,7 +339,11 @@ func client(args []string, cmd string) error {
 	if cmd == "set" || cmd == "land" {
 		fs.StringVar(&from, "from", "", "the agent reporting")
 	}
-	if cmd != "stream" { // a stream's words are taken as they come
+	count := 20
+	if cmd == "history" {
+		fs.IntVar(&count, "n", count, "how many of the latest tracks to list; 0 lists all that are kept")
+	}
+	if cmd != "stream" && cmd != "search" && cmd != "save" { // words are taken as they come
 		args = flagsFirst(args)
 	}
 	if err := fs.Parse(args); err != nil {
@@ -307,6 +353,7 @@ func client(args []string, cmd string) error {
 		return errors.New("-from may use letters, digits, dot, dash and underscore, up to 64 characters")
 	}
 	method, path, body := http.MethodPost, "/"+cmd, ""
+	timeout := 5 * time.Second
 	switch cmd {
 	case "status":
 		method = http.MethodGet
@@ -345,15 +392,39 @@ func client(args []string, cmd string) error {
 			return fmt.Errorf("usage: dubd stream [-addr host:port] <link | search words>: %w", err)
 		}
 		method = http.MethodPut
+	case "search":
+		// No words lists the last search again.
+		if body = strings.Join(fs.Args(), " "); body == "" {
+			method = http.MethodGet
+		}
+		timeout = time.Minute // the daemon loads a page
+	case "history", "saved":
+		method = http.MethodGet
+		if count < 0 {
+			return errors.New("-n must not be negative")
+		}
+	case "save":
+		if fs.NArg() < 1 || !library.ValidName(fs.Arg(0)) {
+			return errors.New("usage: dubd save [-addr host:port] <name> [link | search words | number]; a name uses letters, digits, dot, dash and underscore, and is not a number")
+		}
+		method, path, body = http.MethodPut, "/saved/"+fs.Arg(0), strings.Join(fs.Args()[1:], " ")
+	case "unsave":
+		if fs.NArg() != 1 || !library.ValidName(fs.Arg(0)) {
+			return errors.New("usage: dubd unsave [-addr host:port] <name>")
+		}
+		method, path = http.MethodDelete, "/saved/"+fs.Arg(0)
 	}
-	if (cmd == "status" || cmd == "pause" || cmd == "play" || cmd == "next") && fs.NArg() > 0 {
-		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	switch cmd {
+	case "status", "pause", "play", "next", "history", "saved":
+		if fs.NArg() > 0 {
+			return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+		}
 	}
 	req, err := http.NewRequest(method, "http://"+*addr+path, strings.NewReader(body))
 	if err != nil {
 		return err
 	}
-	httpClient := &http.Client{Timeout: 5 * time.Second}
+	httpClient := &http.Client{Timeout: timeout}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("no dubd daemon answering at %s: %w", *addr, err)
@@ -362,6 +433,19 @@ func client(args []string, cmd string) error {
 	out, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(out)))
+	}
+	// The library's answers are lists, printed as lines; the rest is the
+	// daemon's state, printed as it comes.
+	switch cmd {
+	case "search":
+		out, err = printResults(out)
+	case "history":
+		out, err = printHistory(out, count)
+	case "saved", "save", "unsave":
+		out, err = printSaved(out)
+	}
+	if err != nil {
+		return fmt.Errorf("unexpected answer from the daemon: %w", err)
 	}
 	_, err = os.Stdout.Write(out)
 	return err
