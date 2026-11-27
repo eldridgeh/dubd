@@ -171,11 +171,11 @@ type Player struct {
 	lastPos      float64
 	lastProgress time.Time
 	page         page
-	playing      string // title last logged
-	cand         Track  // track the page shows, until it has held steady
+	playing      string  // title last logged
+	cand         Track   // track the page shows, until it has held steady
 	candSeen     int     // checks on which it was playing
 	candPos      float64 // where playback was on the last check
-	told         string // track last passed to OnTrack
+	told         string  // track last passed to OnTrack
 	lastErr      string
 
 	searchMu sync.Mutex // one Search at a time
