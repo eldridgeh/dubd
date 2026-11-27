@@ -80,11 +80,12 @@ const tickJS = `(() => {
     out.loaded = !!(v.currentSrc || v.src);
     for (const k of ['preservesPitch', 'webkitPreservesPitch']) { if (k in v) v[k] = want.keepPitch; }
     // A dip in volume that was cut short, by an error or by dubd stopping
-    // part way, is put right here.
-    if (v.dataset.dubdVol && (!want.play || Date.now() - Number(v.dataset.dubdDipAt || 0) > 3000)) {
+    // part way, is put right here. dubd runs a dip from start to end before
+    // it runs this script again, so a volume still kept on the element
+    // means the dip did not finish.
+    if (v.dataset.dubdVol) {
       v.volume = Number(v.dataset.dubdVol);
       delete v.dataset.dubdVol;
-      delete v.dataset.dubdDipAt;
     }
     // With nothing to be heard the rate is simply set. While sound is
     // playing dubd changes it inside a dip in volume (see dipJS), which it
@@ -140,10 +141,9 @@ const dipJS = `(() => {
   const v = document.querySelector('video');
   if (!v) return JSON.stringify({ok: false});
   if (!v.dataset.dubdVol) v.dataset.dubdVol = String(v.volume);
-  v.dataset.dubdDipAt = String(Date.now());
   v.volume = Math.max(0, Math.min(1, Number(v.dataset.dubdVol) * dip.volume));
   if (dip.rate) v.playbackRate = dip.rate;
-  if (dip.last) { delete v.dataset.dubdVol; delete v.dataset.dubdDipAt; }
+  if (dip.last) delete v.dataset.dubdVol;
   return JSON.stringify({ok: true});
 })()`
 
