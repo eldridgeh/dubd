@@ -212,7 +212,7 @@ func run(args []string) error {
 		Stream: stream, Curve: curve, KeepPitch: !*tape,
 		Settle: *settle, StaleAfter: *staleAfter, SurfaceFile: surfaceFile(*name),
 		OnResults: func(query string, tracks []player.Track) {
-			if err := lib.SetResults(query, tracks); err != nil {
+			if _, err := lib.SetResults(query, tracks); err != nil {
 				log.Error("writing the library", "error", err)
 			}
 		},

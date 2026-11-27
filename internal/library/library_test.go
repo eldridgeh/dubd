@@ -28,7 +28,18 @@ func TestKeptAcrossRuns(t *testing.T) {
 	l.now = func() time.Time { return at }
 
 	tracks := []player.Track{{ID: "aaaaaaaaaaa", Title: "One", By: "A"}, {ID: "bbbbbbbbbbb", Title: "Two"}}
-	if err := l.SetResults("heavy dub", tracks); err != nil {
+	kept, err := l.SetResults("heavy dub", tracks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What comes back is this search, whatever is recorded after it.
+	if _, err := l.SetResults("another", nil); err != nil {
+		t.Fatal(err)
+	}
+	if kept.Query != "heavy dub" || len(kept.Tracks) != 2 || kept.Tracks[0].Link == "" {
+		t.Fatalf("SetResults returned %+v", kept)
+	}
+	if _, err := l.SetResults("heavy dub", tracks); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Played(tracks[0]); err != nil {
@@ -143,7 +154,7 @@ func TestResolve(t *testing.T) {
 	if _, err := l.Resolve("2"); err == nil || !strings.Contains(err.Error(), "dubd search") {
 		t.Fatalf("a number with no search: %v", err)
 	}
-	_ = l.SetResults("q", []player.Track{{ID: "aaaaaaaaaaa", Title: "One"}, {ID: "bbbbbbbbbbb", Title: "Two"}})
+	_, _ = l.SetResults("q", []player.Track{{ID: "aaaaaaaaaaa", Title: "One"}, {ID: "bbbbbbbbbbb", Title: "Two"}})
 	_ = l.Save("chill", player.Stream{URL: "https://music.youtube.com/watch?list=PL1"})
 
 	for text, want := range map[string]player.Stream{
@@ -175,7 +186,7 @@ func TestManyWritersAtOnce(t *testing.T) {
 			defer wg.Done()
 			_ = l.Played(player.Track{ID: fmt.Sprintf("%011d", i), Title: "T"})
 			_ = l.Save(fmt.Sprintf("s%d", i), player.Stream{Query: "x"})
-			_ = l.SetResults("q", []player.Track{{ID: "aaaaaaaaaaa", Title: "One"}})
+			_, _ = l.SetResults("q", []player.Track{{ID: "aaaaaaaaaaa", Title: "One"}})
 			_, _ = l.Resolve("1")
 			_ = l.History()
 			_ = l.Saved()

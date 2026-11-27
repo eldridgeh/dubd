@@ -123,8 +123,8 @@ func linked(t player.Track) player.Track {
 	return t
 }
 
-// SetResults records what a search returned.
-func (l *Library) SetResults(query string, tracks []player.Track) error {
+// SetResults records what a search returned, and returns it as kept.
+func (l *Library) SetResults(query string, tracks []player.Track) (Results, error) {
 	kept := make([]player.Track, 0, len(tracks))
 	for _, t := range tracks {
 		kept = append(kept, linked(t))
@@ -132,7 +132,9 @@ func (l *Library) SetResults(query string, tracks []player.Track) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.c.Results = Results{Query: query, At: l.now().UTC(), Tracks: kept}
-	return l.write()
+	r := l.c.Results
+	r.Tracks = append([]player.Track{}, kept...)
+	return r, l.write()
 }
 
 // Results returns what the last search returned.

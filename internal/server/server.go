@@ -183,11 +183,14 @@ func New(p Player, board *metric.Board, lib *library.Library, version string) ht
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		if err := lib.SetResults(query, tracks); err != nil {
+		// Answer with this search, not with whatever is the last search by
+		// now: the player records its own searches too.
+		results, err := lib.SetResults(query, tracks)
+		if err != nil {
 			http.Error(w, "could not write the library: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		reply(w, lib.Results())
+		reply(w, results)
 	})
 	mux.HandleFunc("GET /history", func(w http.ResponseWriter, _ *http.Request) { reply(w, lib.History()) })
 	mux.HandleFunc("GET /saved", func(w http.ResponseWriter, _ *http.Request) { reply(w, lib.Saved()) })
